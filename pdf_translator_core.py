@@ -11,6 +11,9 @@ from grouping_engine import group_page
 FONT_PATH = Path(__file__).resolve().parent / "fonts" / "NotoSansKR-Regular.ttf"
 FONT_NAME = "NotoSansKR"
 IMAGE_OVERLAP_TOLERANCE = 0.5
+IMAGE_NEAR_DISTANCE_RATIO = 1.5
+IMAGE_NEAR_DISTANCE_MIN = 4.0
+IMAGE_NEAR_DISTANCE_MAX = 18.0
 
 
 def translate_text_blocks(text: str, source_lang: str = "auto", target_lang: str = "ko") -> str:
@@ -81,6 +84,34 @@ def _overlaps_image(rect: fitz.Rect, image_rects: list[fitz.Rect]) -> bool:
     return any(expanded.intersects(image_rect) for image_rect in image_rects)
 
 
+def _distance_to_rect(text_rect: fitz.Rect, image_rect: fitz.Rect) -> float:
+    """Return the shortest edge-to-edge distance between two rectangles."""
+    dx = max(image_rect.x0 - text_rect.x1, text_rect.x0 - image_rect.x1, 0.0)
+    dy = max(image_rect.y0 - text_rect.y1, text_rect.y0 - image_rect.y1, 0.0)
+    return (dx * dx + dy * dy) ** 0.5
+
+
+def _nearest_image_distance(rect: fitz.Rect, image_rects: list[fitz.Rect]) -> tuple[float, fitz.Rect | None]:
+    if not image_rects:
+        return float("inf"), None
+    distances = [( _distance_to_rect(rect, image_rect), image_rect) for image_rect in image_rects]
+    return min(distances, key=lambda item: item[0])
+
+
+def _is_near_image(rect: fitz.Rect, image_rects: list[fitz.Rect]) -> tuple[bool, float, fitz.Rect | None]:
+    """Classify non-overlapping text as near an image using text size as the scale."""
+    distance, image_rect = _nearest_image_distance(rect, image_rects)
+    if image_rect is None:
+        return False, distance, None
+
+    text_height = max(1.0, rect.height)
+    threshold = min(
+        IMAGE_NEAR_DISTANCE_MAX,
+        max(IMAGE_NEAR_DISTANCE_MIN, text_height * IMAGE_NEAR_DISTANCE_RATIO),
+    )
+    return distance <= threshold, distance, image_rect
+
+
 def _get_underline_rects(page: fitz.Page) -> list[fitz.Rect]:
     """Find thin horizontal vector lines that are likely text underlines."""
     result: list[fitz.Rect] = []
@@ -109,7 +140,6 @@ def _underlines_for_replacement(
         horizontal_overlap = max(0.0, min(rect.x1, line.x1) - max(rect.x0, line.x0))
         if horizontal_overlap < min(line.width * 0.5, rect.width * 0.4):
             continue
-        # Underlines normally sit directly on or just below the text bbox.
         if line.y0 < rect.y0 - 2 or line.y0 > rect.y1 + max(4.0, rect.height * 0.35):
             continue
         result.append(line)
@@ -142,7 +172,7 @@ def translate_pdf_file(
     target_lang: str = "ko",
     debug_grouping: bool = False,
 ) -> int:
-    """Translate PDF using deterministic layout grouping, without AI grouping."""
+    """Translate PDF using deterministic layout grouping, including safe image-adjacent text."""
     if not FONT_PATH.exists():
         raise FileNotFoundError(
             f"Noto Sans KR font not found: {FONT_PATH}\n"
@@ -152,6 +182,7 @@ def translate_pdf_file(
     doc = fitz.open(input_pdf_path)
     translated_count = 0
     skipped_image_count = 0
+    translated_near_image_count = 0
     try:
         for page_number, page in enumerate(doc, start=1):
             lines = _get_span_info(page)
@@ -173,6 +204,14 @@ def translate_pdf_file(
                     print(f"이미지 겹침으로 건너뜀 (페이지 {page_number}, group {group_index}): {text[:80]}")
                     continue
 
+                near_image, image_distance, nearest_image = _is_near_image(rect, image_rects)
+                if near_image:
+                    translated_near_image_count += 1
+                    print(
+                        f"이미지 근처 텍스트 번역 (페이지 {page_number}, group {group_index}, "
+                        f"거리 {image_distance:.1f}): {text[:80]}"
+                    )
+
                 translated = translate_text_blocks(text, source_lang, target_lang)
                 if translated == text:
                     continue
@@ -184,10 +223,9 @@ def translate_pdf_file(
                 print("번역:", translated[:120])
                 print("group type:", item.get("group_type"))
                 print("group bbox:", rect)
+                if near_image and nearest_image is not None:
+                    print("nearest image bbox:", nearest_image)
 
-            # Remove the original text. If a thin vector line is attached to a
-            # replaced text box (typically an underline from the source PDF),
-            # redact that line too. Other graphics remain untouched.
             for rect, _, _ in replacements:
                 page.add_redact_annot(rect, fill=False, cross_out=False)
                 for underline in _underlines_for_replacement(rect, underline_rects):
@@ -207,6 +245,7 @@ def translate_pdf_file(
         doc.close()
 
     print("이미지와 겹쳐 건너뛴 텍스트:", skipped_image_count)
+    print("이미지와 가깝지만 바깥에 있어 번역한 텍스트:", translated_near_image_count)
     return translated_count
 
 
