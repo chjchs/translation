@@ -4,6 +4,8 @@ import html
 import json
 import os
 import re
+import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Iterable
@@ -18,48 +20,83 @@ BULLET_CHARS = "•●○◦▪▫■□◆◇"
 IMAGE_OVERLAP_TOLERANCE = 0.5
 OPENAI_API_URL = os.getenv("OPENAI_API_URL", "https://api.openai.com/v1/chat/completions")
 OPENAI_TRANSLATION_MODEL = os.getenv("OPENAI_TRANSLATION_MODEL", "gpt-4.1-mini")
+MAX_TRANSLATION_RETRIES = 4
 
 
-def _openai_translation(text: str, source_lang: str, target_lang: str) -> str | None:
-    """Translate one logical group with OpenAI. Never falls back to Google."""
+def _openai_request(messages: list[dict], timeout: int = 120) -> dict | None:
+    """Make one OpenAI request with exponential backoff for HTTP 429."""
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key or not text.strip():
+    if not api_key:
+        print("OPENAI_API_KEY is not set")
         return None
 
-    prompt = (
-        f"Translate the following text from {source_lang} to {target_lang}. "
-        "This is one logical PDF text group. Preserve paragraph meaning and line "
-        "structure where useful. Return only the translation.\n\n" + text
-    )
     body = {
         "model": OPENAI_TRANSLATION_MODEL,
         "temperature": 0,
-        "messages": [
-            {"role": "system", "content": "You are a precise PDF translation assistant."},
-            {"role": "user", "content": prompt},
-        ],
+        "messages": messages,
     }
-    req = urllib.request.Request(
-        OPENAI_API_URL,
-        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
+
+    for attempt in range(MAX_TRANSLATION_RETRIES + 1):
+        req = urllib.request.Request(
+            OPENAI_API_URL,
+            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            if exc.code != 429 or attempt >= MAX_TRANSLATION_RETRIES:
+                print(f"OpenAI request failed ({exc.code}): {detail[:500]}")
+                return None
+
+            retry_after = exc.headers.get("Retry-After")
+            try:
+                wait = float(retry_after) if retry_after else 2 ** attempt
+            except ValueError:
+                wait = 2 ** attempt
+            wait = min(max(wait, 1.0), 30.0)
+            print(f"OpenAI rate limit (429). Retrying in {wait:.1f}s ({attempt + 1}/{MAX_TRANSLATION_RETRIES})")
+            time.sleep(wait)
+        except (urllib.error.URLError, TimeoutError) as exc:
+            if attempt >= MAX_TRANSLATION_RETRIES:
+                print(f"OpenAI request failed: {exc}")
+                return None
+            wait = min(2 ** attempt, 16)
+            print(f"OpenAI network error. Retrying in {wait}s ({attempt + 1}/{MAX_TRANSLATION_RETRIES})")
+            time.sleep(wait)
+        except Exception as exc:
+            print(f"OpenAI request failed: {exc}")
+            return None
+    return None
+
+
+def _openai_translation(text: str, source_lang: str, target_lang: str) -> str | None:
+    """Single-group translation helper kept for compatibility; no Google fallback."""
+    if not text.strip():
+        return text
+    result = _openai_request([
+        {"role": "system", "content": "You are a precise PDF translation assistant."},
+        {"role": "user", "content": (
+            f"Translate the following text from {source_lang} to {target_lang}. "
+            "Preserve paragraph meaning and line structure where useful. "
+            "Return only the translation.\n\n" + text
+        )},
+    ])
+    if not result:
+        return None
     try:
-        with urllib.request.urlopen(req, timeout=90) as response:
-            result = json.loads(response.read().decode("utf-8"))
-        translated = result["choices"][0]["message"]["content"].strip()
-        return translated or None
-    except Exception as exc:
-        print(f"AI translation failed; keeping original text: {exc}")
+        return result["choices"][0]["message"]["content"].strip() or None
+    except (KeyError, TypeError):
         return None
 
 
 def translate_text_blocks(text: str, source_lang: str = "auto", target_lang: str = "ko") -> str:
-    """Translate one logical text group with OpenAI only."""
     if not text or not text.strip():
         return text
     translated = _openai_translation(text, source_lang, target_lang)
@@ -67,7 +104,6 @@ def translate_text_blocks(text: str, source_lang: str = "auto", target_lang: str
 
 
 def _get_span_info(page: fitz.Page) -> list[dict]:
-    """Extract lines while retaining every original span and PDF block identity."""
     result = []
     data = page.get_text("dict")
     for block_index, block in enumerate(data.get("blocks", [])):
@@ -124,7 +160,6 @@ def _is_bullet_only(text: str) -> bool:
 
 
 def _local_group_lines(lines: list[dict]) -> list[dict]:
-    """Safe non-AI grouping: keep PDF lines separate except bullet + following line."""
     groups: list[dict] = []
     i = 0
     while i < len(lines):
@@ -181,48 +216,74 @@ def _span_style(span: dict) -> tuple[str, bool, float]:
     return f"#{r:02x}{g:02x}{b:02x}", bold, size
 
 
-def _translate_group_with_markers(group: dict, source_lang: str, target_lang: str) -> list[tuple[str, dict]] | None:
-    """Translate one logical group once and preserve original span markers."""
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    spans = group.get("spans", [])
-    if not api_key or not spans:
-        return None
+def _build_batch_payload(groups: list[dict]) -> tuple[str, dict[int, list[dict]]]:
+    """Build one request for a page and retain the original span mapping locally."""
+    group_payload = []
+    marker_map: dict[int, list[dict]] = {}
+    for group_id, group in enumerate(groups):
+        spans = group.get("spans", [])
+        marker_map[group_id] = spans
+        tagged = "".join(
+            f"<s{i}>{html.escape(str(span.get('text', '')))}</s{i}>"
+            for i, span in enumerate(spans)
+        )
+        group_payload.append({"id": group_id, "text": tagged})
 
-    pieces = [f"<s{i}>{span.get('text', '')}</s{i}>" for i, span in enumerate(spans)]
-    source = "".join(pieces)
-    prompt = (
-        f"Translate the following text from {source_lang} to {target_lang}. "
-        "This is ONE translation unit. Preserve every <sN>...</sN> tag exactly "
-        "once and in the same order. Do not add, remove, merge, or rename tags. "
-        "Return only the translated tagged text.\n\n" + source
+    return json.dumps(group_payload, ensure_ascii=False), marker_map
+
+
+def _translate_groups_batch(
+    groups: list[dict], source_lang: str, target_lang: str
+) -> dict[int, list[tuple[str, dict]]]:
+    """Translate all groups on one page with one OpenAI request."""
+    if not groups or not os.getenv("OPENAI_API_KEY", "").strip():
+        return {}
+
+    payload, marker_map = _build_batch_payload(groups)
+    system = (
+        "You translate PDF text groups. Return valid JSON only in this exact shape: "
+        '{"translations":[{"id":0,"text":"<s0>...</s0>..."}]}. '
+        "Translate each group independently but use the supplied context. "
+        "Preserve every <sN> tag exactly once and in the same order within its group. "
+        "Do not add, remove, merge, or rename tags. Return every supplied group id."
     )
-    body = {
-        "model": OPENAI_TRANSLATION_MODEL,
-        "temperature": 0,
-        "messages": [
-            {"role": "system", "content": "You translate PDF text while preserving inline style markers."},
-            {"role": "user", "content": prompt},
-        ],
-    }
-    req = urllib.request.Request(
-        OPENAI_API_URL,
-        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        method="POST",
+    user = (
+        f"Translate these logical PDF text groups from {source_lang} to {target_lang}. "
+        "Do not translate the XML-like marker names themselves.\n\n" + payload
     )
+    result = _openai_request([
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ])
+    if not result:
+        return {}
+
     try:
-        with urllib.request.urlopen(req, timeout=90) as response:
-            result = json.loads(response.read().decode("utf-8"))
-        translated = result["choices"][0]["message"]["content"].strip()
-    except Exception as exc:
-        print(f"AI styled translation failed; keeping original group: {exc}")
-        return None
+        content = result["choices"][0]["message"]["content"]
+        data = json.loads(content)
+        items = data["translations"]
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        print("Batch AI translation returned invalid JSON; page will be skipped")
+        return {}
 
-    matches = re.findall(r"<s(\d+)>(.*?)</s\1>", translated, flags=re.DOTALL)
-    if len(matches) != len(spans):
-        print("AI translation markers invalid; keeping original group")
-        return None
-    return [(text, spans[int(index)]) for index, text in matches]
+    output: dict[int, list[tuple[str, dict]]] = {}
+    for item in items:
+        try:
+            group_id = int(item["id"])
+            translated = str(item["text"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if group_id not in marker_map:
+            continue
+        spans = marker_map[group_id]
+        matches = re.findall(r"<s(\d+)>(.*?)</s\1>", translated, flags=re.DOTALL)
+        expected = list(range(len(spans)))
+        actual = [int(index) for index, _ in matches]
+        if actual != expected:
+            print(f"Invalid style markers for group {group_id}; group kept unchanged")
+            continue
+        output[group_id] = [(text, spans[int(index)]) for index, text in matches]
+    return output
 
 
 def _insert_styled_html(page: fitz.Page, rect: fitz.Rect, segments: list[tuple[str, dict]]) -> bool:
@@ -271,6 +332,8 @@ def translate_pdf_file(
 ) -> int:
     if not FONT_PATH.exists():
         raise FileNotFoundError(f"Noto Sans KR font not found: {FONT_PATH}")
+    if use_ai_grouping and not os.getenv("OPENAI_API_KEY", "").strip():
+        raise RuntimeError("OPENAI_API_KEY is required when AI grouping/translation is enabled")
 
     doc = fitz.open(input_pdf_path)
     translated_count = 0
@@ -280,9 +343,9 @@ def translate_pdf_file(
             lines = _get_span_info(page)
             groups = _group_lines(page, lines, use_ai_grouping)
             image_rects = _get_image_rects(page)
-            replacements: list[tuple[fitz.Rect, str, float, list[tuple[str, dict]] | None]] = []
+            eligible_groups: list[tuple[int, dict]] = []
 
-            for group in groups:
+            for group_id, group in enumerate(groups):
                 text = group["text"].strip()
                 if not text or len(text) < 2:
                     continue
@@ -291,19 +354,24 @@ def translate_pdf_file(
                     skipped_image_count += 1
                     print(f"이미지 겹침으로 건너뜀 (페이지 {page_number}): {text[:80]}")
                     continue
+                eligible_groups.append((group_id, group))
 
-                styled = _translate_group_with_markers(group, source_lang, target_lang) if use_ai_grouping else None
-                if styled:
-                    translated = "".join(segment for segment, _ in styled)
-                else:
-                    translated = _openai_translation(text, source_lang, target_lang) if use_ai_grouping else text
-                    if translated is None:
-                        # No translation fallback is used. Preserve the original text.
-                        continue
+            # One translation request per page instead of one request per group.
+            styled_by_id = _translate_groups_batch(
+                [group for _, group in eligible_groups], source_lang, target_lang
+            ) if use_ai_grouping else {}
 
-                if translated == text:
+            replacements: list[tuple[fitz.Rect, str, float, list[tuple[str, dict]] | None]] = []
+            for local_id, (original_group_id, group) in enumerate(eligible_groups):
+                text = group["text"].strip()
+                styled = styled_by_id.get(local_id)
+                if not styled:
+                    print(f"페이지 {page_number}, group {original_group_id}: translation unavailable; keeping original")
                     continue
-                replacements.append((rect, translated, group["size"], styled))
+                translated = "".join(segment for segment, _ in styled)
+                if not translated or translated == text:
+                    continue
+                replacements.append((fitz.Rect(group["bbox"]), translated, group["size"], styled))
                 print("원문:", text[:120])
                 print("번역:", translated[:120])
                 print("group source:", group.get("group_source"))
