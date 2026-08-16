@@ -44,8 +44,23 @@ def translate_pdf_file(
                 continue
 
             rect = fitz.Rect(block[0], block[1], block[2], block[3])
-            fontsize = max(8.0, min(18.0, (block[3] - block[1]) * 0.75))
-            page.insert_textbox(
+            fontsize = 12
+
+            while fontsize >= 4:
+                result = page.insert_textbox(
+                    rect,
+                    translated,
+                    fontsize=fontsize,
+                    fontname="helv",
+                    color=(0, 0, 0),
+                    align=fitz.TEXT_ALIGN_LEFT,
+                )
+
+                if result >= 0:
+                    break
+
+                fontsize -= 0.5
+            result = page.insert_textbox(
                 rect,
                 translated,
                 fontsize=fontsize,
@@ -53,7 +68,10 @@ def translate_pdf_file(
                 color=(0, 0, 0),
                 align=fitz.TEXT_ALIGN_LEFT,
             )
-            translated_count += 1
+
+            print("원문:", text[:50])
+            print("번역:", translated[:50])
+            print("삽입 결과:", result)
 
     doc.save(output_pdf_path)
     doc.close()
