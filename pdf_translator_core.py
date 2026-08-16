@@ -81,6 +81,41 @@ def _overlaps_image(rect: fitz.Rect, image_rects: list[fitz.Rect]) -> bool:
     return any(expanded.intersects(image_rect) for image_rect in image_rects)
 
 
+def _get_underline_rects(page: fitz.Page) -> list[fitz.Rect]:
+    """Find thin horizontal vector lines that are likely text underlines."""
+    result: list[fitz.Rect] = []
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        return result
+
+    for drawing in drawings:
+        rect = fitz.Rect(drawing.get("rect", (0, 0, 0, 0)))
+        if (
+            rect.width >= 4
+            and rect.height <= 2.5
+            and rect.width <= page.rect.width * 0.9
+        ):
+            result.append(rect)
+    return result
+
+
+def _underlines_for_replacement(
+    rect: fitz.Rect, underline_rects: list[fitz.Rect]
+) -> list[fitz.Rect]:
+    """Return underline-like drawings belonging to a translated text box."""
+    result = []
+    for line in underline_rects:
+        horizontal_overlap = max(0.0, min(rect.x1, line.x1) - max(rect.x0, line.x0))
+        if horizontal_overlap < min(line.width * 0.5, rect.width * 0.4):
+            continue
+        # Underlines normally sit directly on or just below the text bbox.
+        if line.y0 < rect.y0 - 2 or line.y0 > rect.y1 + max(4.0, rect.height * 0.35):
+            continue
+        result.append(line)
+    return result
+
+
 def _insert_translation(page: fitz.Page, rect: fitz.Rect, text: str, original_font_size: float) -> bool:
     """Insert translated text, shrinking only when the original box is too small."""
     fontsize = max(4.0, original_font_size)
@@ -122,6 +157,7 @@ def translate_pdf_file(
             lines = _get_span_info(page)
             groups = group_page(page, lines, debug=debug_grouping)
             image_rects = _get_image_rects(page)
+            underline_rects = _get_underline_rects(page)
             replacements: list[tuple[fitz.Rect, str, float]] = []
 
             print(f"페이지 {page_number}: {len(lines)} lines -> {len(groups)} logical groups")
@@ -149,10 +185,16 @@ def translate_pdf_file(
                 print("group type:", item.get("group_type"))
                 print("group bbox:", rect)
 
+            # Remove the original text. If a thin vector line is attached to a
+            # replaced text box (typically an underline from the source PDF),
+            # redact that line too. Other graphics remain untouched.
             for rect, _, _ in replacements:
                 page.add_redact_annot(rect, fill=False, cross_out=False)
+                for underline in _underlines_for_replacement(rect, underline_rects):
+                    page.add_redact_annot(underline, fill=False, cross_out=False)
+
             if replacements:
-                page.apply_redactions(images=0, graphics=0, text=0)
+                page.apply_redactions(images=0, graphics=2, text=0)
 
             for rect, translated, original_font_size in replacements:
                 inserted = _insert_translation(page, rect, translated, original_font_size)
