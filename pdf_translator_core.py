@@ -3,12 +3,12 @@ from __future__ import annotations
 import html
 import json
 import os
+import re
 import urllib.request
 from pathlib import Path
 from typing import Iterable
 
 import fitz
-from deep_translator import GoogleTranslator
 
 from ai_grouping import group_page
 
@@ -16,17 +16,54 @@ FONT_PATH = Path(__file__).resolve().parent / "fonts" / "NotoSansKR-Regular.ttf"
 FONT_NAME = "NotoSansKR"
 BULLET_CHARS = "•●○◦▪▫■□◆◇"
 IMAGE_OVERLAP_TOLERANCE = 0.5
+OPENAI_API_URL = os.getenv("OPENAI_API_URL", "https://api.openai.com/v1/chat/completions")
+OPENAI_TRANSLATION_MODEL = os.getenv("OPENAI_TRANSLATION_MODEL", "gpt-4.1-mini")
+
+
+def _openai_translation(text: str, source_lang: str, target_lang: str) -> str | None:
+    """Translate one logical group with OpenAI. Never falls back to Google."""
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key or not text.strip():
+        return None
+
+    prompt = (
+        f"Translate the following text from {source_lang} to {target_lang}. "
+        "This is one logical PDF text group. Preserve paragraph meaning and line "
+        "structure where useful. Return only the translation.\n\n" + text
+    )
+    body = {
+        "model": OPENAI_TRANSLATION_MODEL,
+        "temperature": 0,
+        "messages": [
+            {"role": "system", "content": "You are a precise PDF translation assistant."},
+            {"role": "user", "content": prompt},
+        ],
+    }
+    req = urllib.request.Request(
+        OPENAI_API_URL,
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=90) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        translated = result["choices"][0]["message"]["content"].strip()
+        return translated or None
+    except Exception as exc:
+        print(f"AI translation failed; keeping original text: {exc}")
+        return None
 
 
 def translate_text_blocks(text: str, source_lang: str = "auto", target_lang: str = "ko") -> str:
-    """Translate one logical text group, never individual PDF spans."""
+    """Translate one logical text group with OpenAI only."""
     if not text or not text.strip():
         return text
-    try:
-        translated = GoogleTranslator(source=source_lang, target=target_lang).translate(text)
-        return translated if translated else text
-    except Exception:
-        return text
+    translated = _openai_translation(text, source_lang, target_lang)
+    return translated if translated is not None else text
 
 
 def _get_span_info(page: fitz.Page) -> list[dict]:
@@ -43,16 +80,14 @@ def _get_span_info(page: fitz.Page) -> list[dict]:
             text = "".join(s.get("text", "") for s in spans).strip()
             if not text:
                 continue
-            result.append(
-                {
-                    "text": text,
-                    "bbox": fitz.Rect(line["bbox"]),
-                    "size": max(float(s.get("size", 0)) for s in spans),
-                    "spans": spans,
-                    "block_index": block_index,
-                    "line_index": line_index,
-                }
-            )
+            result.append({
+                "text": text,
+                "bbox": fitz.Rect(line["bbox"]),
+                "size": max(float(s.get("size", 0)) for s in spans),
+                "spans": spans,
+                "block_index": block_index,
+                "line_index": line_index,
+            })
     return result
 
 
@@ -89,7 +124,7 @@ def _is_bullet_only(text: str) -> bool:
 
 
 def _local_group_lines(lines: list[dict]) -> list[dict]:
-    """Safe fallback when AI is unavailable: keep PDF lines separate except bullets."""
+    """Safe non-AI grouping: keep PDF lines separate except bullet + following line."""
     groups: list[dict] = []
     i = 0
     while i < len(lines):
@@ -147,24 +182,22 @@ def _span_style(span: dict) -> tuple[str, bool, float]:
 
 
 def _translate_group_with_markers(group: dict, source_lang: str, target_lang: str) -> list[tuple[str, dict]] | None:
-    """Translate a whole logical group once while asking the model to retain span tags."""
-    if not os.getenv("OPENAI_API_KEY", "").strip():
-        return None
+    """Translate one logical group once and preserve original span markers."""
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
     spans = group.get("spans", [])
-    if not spans:
+    if not api_key or not spans:
         return None
-    pieces = []
-    for i, span in enumerate(spans):
-        pieces.append(f"<s{i}>{span.get('text', '')}</s{i}>")
+
+    pieces = [f"<s{i}>{span.get('text', '')}</s{i}>" for i, span in enumerate(spans)]
     source = "".join(pieces)
     prompt = (
-        "Translate the following text into Korean. This is ONE translation unit. "
-        "Preserve every <sN>...</sN> tag exactly once and in the same order. "
-        "Do not add, remove, merge, or rename tags. Return only the translated tagged text.\n\n"
-        + source
+        f"Translate the following text from {source_lang} to {target_lang}. "
+        "This is ONE translation unit. Preserve every <sN>...</sN> tag exactly "
+        "once and in the same order. Do not add, remove, merge, or rename tags. "
+        "Return only the translated tagged text.\n\n" + source
     )
     body = {
-        "model": os.getenv("OPENAI_TRANSLATION_MODEL", "gpt-4.1-mini"),
+        "model": OPENAI_TRANSLATION_MODEL,
         "temperature": 0,
         "messages": [
             {"role": "system", "content": "You translate PDF text while preserving inline style markers."},
@@ -172,29 +205,27 @@ def _translate_group_with_markers(group: dict, source_lang: str, target_lang: st
         ],
     }
     req = urllib.request.Request(
-        os.getenv("OPENAI_API_URL", "https://api.openai.com/v1/chat/completions"),
+        OPENAI_API_URL,
         data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-        headers={"Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}", "Content-Type": "application/json"},
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         method="POST",
     )
     try:
         with urllib.request.urlopen(req, timeout=90) as response:
             result = json.loads(response.read().decode("utf-8"))
-        translated = result["choices"][0]["message"]["content"]
+        translated = result["choices"][0]["message"]["content"].strip()
     except Exception as exc:
-        print(f"AI translation failed; using GoogleTranslator: {exc}")
+        print(f"AI styled translation failed; keeping original group: {exc}")
         return None
 
-    import re
     matches = re.findall(r"<s(\d+)>(.*?)</s\1>", translated, flags=re.DOTALL)
     if len(matches) != len(spans):
-        print("AI translation markers invalid; using GoogleTranslator")
+        print("AI translation markers invalid; keeping original group")
         return None
     return [(text, spans[int(index)]) for index, text in matches]
 
 
 def _insert_styled_html(page: fitz.Page, rect: fitz.Rect, segments: list[tuple[str, dict]]) -> bool:
-    """Insert one logical translation unit with each original span's color/weight/size."""
     archive = fitz.Archive()
     try:
         archive.add(str(FONT_PATH), path="fonts/NotoSansKR-Regular.ttf")
@@ -262,11 +293,14 @@ def translate_pdf_file(
                     continue
 
                 styled = _translate_group_with_markers(group, source_lang, target_lang) if use_ai_grouping else None
-                translated = (
-                    "".join(segment for segment, _ in styled)
-                    if styled
-                    else translate_text_blocks(text, source_lang, target_lang)
-                )
+                if styled:
+                    translated = "".join(segment for segment, _ in styled)
+                else:
+                    translated = _openai_translation(text, source_lang, target_lang) if use_ai_grouping else text
+                    if translated is None:
+                        # No translation fallback is used. Preserve the original text.
+                        continue
+
                 if translated == text:
                     continue
                 replacements.append((rect, translated, group["size"], styled))
