@@ -23,15 +23,28 @@ def translate_text_blocks(text: str, source_lang: str = "auto", target_lang: str
         return text
 
 
-def _get_font_size(rect: fitz.Rect) -> float:
-    """Choose a starting font size based on the original text block height."""
-    return max(4.0, min(12.0, rect.height * 0.8))
+def _get_original_font_size(page: fitz.Page, rect: fitz.Rect) -> float:
+    """Get the largest font size used by the original text in this block."""
+    best_size = 12.0
+    try:
+        data = page.get_text("dict", clip=rect)
+        for block in data.get("blocks", []):
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    size = float(span.get("size", 0))
+                    if size > best_size:
+                        best_size = size
+    except Exception:
+        pass
+    return max(4.0, best_size)
 
 
-def _insert_translation(page: fitz.Page, rect: fitz.Rect, text: str) -> bool:
-    """Insert translated text using the embedded Noto Sans KR font."""
-    fontsize = _get_font_size(rect)
+def _insert_translation(page: fitz.Page, rect: fitz.Rect, text: str, original_font_size: float) -> bool:
+    """Insert translated text using Noto Sans KR, starting at the original size."""
+    fontsize = max(4.0, original_font_size)
 
+    # Korean text often occupies more horizontal space than the English text.
+    # Shrink only when necessary, rather than forcing every block to 12pt.
     while fontsize >= 4:
         result = page.insert_textbox(
             rect,
@@ -57,11 +70,11 @@ def translate_pdf_file(
     source_lang: str = "auto",
     target_lang: str = "ko",
 ) -> int:
-    """Translate PDF text blocks while preserving the existing page layout.
+    """Translate PDF text while preserving the original page layout and images.
 
-    The original text in each translated text block is redacted first, then the
-    translated text is inserted into the same rectangle using an embedded Noto
-    Sans KR font. Images, drawings, and the rest of the page are left intact.
+    Original text is redacted and replaced in the same text-block rectangle.
+    The original font size is used as the starting point for the translation.
+    Images and vector graphics underneath/near text are explicitly preserved.
     """
     if not FONT_PATH.exists():
         raise FileNotFoundError(
@@ -75,7 +88,7 @@ def translate_pdf_file(
     try:
         for page in doc:
             blocks = page.get_text("blocks")
-            replacements: list[tuple[fitz.Rect, str]] = []
+            replacements: list[tuple[fitz.Rect, str, float]] = []
 
             for block in blocks:
                 text = (block[4] or "").strip()
@@ -89,23 +102,29 @@ def translate_pdf_file(
                     continue
 
                 rect = fitz.Rect(block[0], block[1], block[2], block[3])
-                replacements.append((rect, translated))
+                original_font_size = _get_original_font_size(page, rect)
+                replacements.append((rect, translated, original_font_size))
 
                 print("원문:", text[:50])
                 print("번역:", translated[:50])
+                print("원본 폰트 크기:", original_font_size)
 
-            # Remove the original text from the page first.
-            for rect, _ in replacements:
+            # Remove only the original text. PyMuPDF's default redaction can
+            # also remove images/graphics intersecting the rectangle, so make
+            # those operations explicit: preserve images and vector graphics.
+            for rect, _, _ in replacements:
                 page.add_redact_annot(rect, fill=(1, 1, 1))
 
             if replacements:
-                page.apply_redactions()
+                page.apply_redactions(images=0, graphics=0, text=0)
 
-            # IMPORTANT: when fontfile is supplied, fontname must be a new,
-            # non-reserved name. Using the default "helv" causes PyMuPDF to
-            # ignore the custom font file and use Helvetica instead.
-            for rect, translated in replacements:
-                inserted = _insert_translation(page, rect, translated)
+            for rect, translated, original_font_size in replacements:
+                inserted = _insert_translation(
+                    page,
+                    rect,
+                    translated,
+                    original_font_size,
+                )
                 print("삽입 결과:", inserted)
 
                 if inserted:
