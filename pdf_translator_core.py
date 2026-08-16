@@ -10,6 +10,7 @@ from deep_translator import GoogleTranslator
 FONT_PATH = Path(__file__).resolve().parent / "fonts" / "NotoSansKR-Regular.ttf"
 FONT_NAME = "NotoSansKR"
 BULLET_CHARS = "•●○◦▪▫■□◆◇"
+IMAGE_OVERLAP_TOLERANCE = 0.5
 
 
 def translate_text_blocks(text: str, source_lang: str = "auto", target_lang: str = "ko") -> str:
@@ -51,28 +52,51 @@ def _get_span_info(page: fitz.Page) -> list[dict]:
     return result
 
 
+def _get_image_rects(page: fitz.Page) -> list[fitz.Rect]:
+    """Return every visible image rectangle, including repeated image occurrences."""
+    rects: list[fitz.Rect] = []
+
+    # get_image_info() returns image occurrences with their actual page bbox.
+    # This also catches repeated uses of the same image resource.
+    try:
+        for info in page.get_image_info(hashes=False, xrefs=False):
+            bbox = info.get("bbox")
+            if bbox:
+                rects.append(fitz.Rect(bbox))
+    except Exception:
+        pass
+
+    # TextPage can contain inline images which are not necessarily returned by
+    # Page.get_images(). Include type=1 blocks as a second source of image bboxes.
+    try:
+        data = page.get_text("dict")
+        for block in data.get("blocks", []):
+            if block.get("type") == 1 and block.get("bbox"):
+                rects.append(fitz.Rect(block["bbox"]))
+    except Exception:
+        pass
+
+    return rects
+
+
+def _overlaps_image(rect: fitz.Rect, image_rects: list[fitz.Rect]) -> bool:
+    """Return True if a text replacement area touches an image."""
+    expanded = fitz.Rect(
+        rect.x0 - IMAGE_OVERLAP_TOLERANCE,
+        rect.y0 - IMAGE_OVERLAP_TOLERANCE,
+        rect.x1 + IMAGE_OVERLAP_TOLERANCE,
+        rect.y1 + IMAGE_OVERLAP_TOLERANCE,
+    )
+    return any(expanded.intersects(image_rect) for image_rect in image_rects)
+
+
 def _is_bullet_only(text: str) -> bool:
     """Return True when a line contains only a bullet/list marker."""
     return text.strip() in BULLET_CHARS
 
 
-def _bullet_prefix(text: str) -> str | None:
-    """Return the bullet prefix when the text begins with a bullet marker."""
-    stripped = text.lstrip()
-    if stripped and stripped[0] in BULLET_CHARS:
-        return stripped[0]
-    return None
-
-
 def _group_lines(lines: list[dict]) -> list[dict]:
-    """Group bullet-only lines with the following text line when appropriate.
-
-    PDF extraction can split a visual bullet such as ``● 교육`` into two lines
-    even though the original slide treats them as one list item. This function
-    joins a bullet-only line with the nearest following text line when they are
-    vertically adjacent and the following line starts at roughly the same
-    horizontal position as the bullet's visual text area.
-    """
+    """Group bullet-only lines with the following text line when appropriate."""
     groups: list[dict] = []
     i = 0
 
@@ -85,8 +109,6 @@ def _group_lines(lines: list[dict]) -> list[dict]:
             vertical_gap = nxt["bbox"].y0 - current["bbox"].y1
             height = max(current["bbox"].height, nxt["bbox"].height, 1.0)
 
-            # A bullet and its text are normally very close vertically.
-            # Avoid joining unrelated lines farther away.
             if -0.5 * height <= vertical_gap <= 1.5 * height:
                 combined_rect = fitz.Rect(
                     min(current["bbox"].x0, nxt["bbox"].x0),
@@ -141,7 +163,13 @@ def translate_pdf_file(
     source_lang: str = "auto",
     target_lang: str = "ko",
 ) -> int:
-    """Translate PDF text while preserving bullet layout, images, and graphics."""
+    """Translate PDF text while protecting images and preserving bullet layout.
+
+    A text line that overlaps an image is intentionally skipped. This is the
+    safest behavior for diagrams/screenshots whose English labels may already
+    be baked into the image: removing that text with PDF redaction can alter or
+    erase the image itself. Image-free text is still replaced normally.
+    """
     if not FONT_PATH.exists():
         raise FileNotFoundError(
             f"Noto Sans KR font not found: {FONT_PATH}\n"
@@ -150,11 +178,13 @@ def translate_pdf_file(
 
     doc = fitz.open(input_pdf_path)
     translated_count = 0
+    skipped_image_count = 0
 
     try:
-        for page in doc:
+        for page_number, page in enumerate(doc, start=1):
             lines = _get_span_info(page)
             groups = _group_lines(lines)
+            image_rects = _get_image_rects(page)
             replacements: list[tuple[fitz.Rect, str, float]] = []
 
             for item in groups:
@@ -162,13 +192,24 @@ def translate_pdf_file(
                 if not text or len(text) < 2:
                     continue
 
-                # Keep list markers unchanged. The marker is part of the visual
-                # layout and should not be translated or independently placed.
+                rect = fitz.Rect(item["bbox"])
+
+                # Never create a redaction over an image. If text is actually
+                # part of a screenshot/diagram image, it is not a standalone
+                # PDF text object we can safely replace without damaging the
+                # image. Keeping the image intact is the priority.
+                if _overlaps_image(rect, image_rects):
+                    skipped_image_count += 1
+                    print(
+                        f"이미지 겹침으로 건너뜀 (페이지 {page_number}):",
+                        text[:80],
+                    )
+                    continue
+
                 translated = translate_text_blocks(text, source_lang, target_lang)
                 if translated == text:
                     continue
 
-                rect = fitz.Rect(item["bbox"])
                 original_font_size = _get_original_font_size(item)
                 replacements.append((rect, translated, original_font_size))
 
@@ -176,13 +217,12 @@ def translate_pdf_file(
                 print("번역:", translated[:80])
                 print("원본 폰트 크기:", original_font_size)
 
-            # Do not paint over the redacted area. In particular, a white fill
-            # can hide an image/background underneath a text block.
+            # Redact only text regions that do NOT overlap images. Images and
+            # vector graphics are explicitly ignored by apply_redactions().
             for rect, _, _ in replacements:
-                page.add_redact_annot(rect, fill=False)
+                page.add_redact_annot(rect, fill=False, cross_out=False)
 
             if replacements:
-                # Preserve images and graphics. Only the original text is removed.
                 page.apply_redactions(images=0, graphics=0, text=0)
 
             for rect, translated, original_font_size in replacements:
@@ -196,10 +236,14 @@ def translate_pdf_file(
                 if inserted:
                     translated_count += 1
 
-        doc.save(output_pdf_path, garbage=4, deflate=True)
+        # Do not aggressively garbage-collect the PDF after redaction. Keeping
+        # the original resource objects is safer for complex PPT-generated PDFs
+        # containing shared image/XObject resources.
+        doc.save(output_pdf_path, garbage=2, deflate=True)
     finally:
         doc.close()
 
+    print("이미지와 겹쳐 건너뛴 텍스트:", skipped_image_count)
     return translated_count
 
 
