@@ -7,7 +7,8 @@ import fitz
 from deep_translator import GoogleTranslator
 
 
-FONT_PATH = Path(__file__).resolve().parent / "fonts" / "NotoSansCJKkr-Regular.ttf"
+FONT_PATH = Path(__file__).resolve().parent / "fonts" / "NotoSansKR-Regular.ttf"
+FONT_NAME = "NotoSansKR"
 
 
 def translate_text_blocks(text: str, source_lang: str = "auto", target_lang: str = "ko") -> str:
@@ -22,22 +23,21 @@ def translate_text_blocks(text: str, source_lang: str = "auto", target_lang: str
         return text
 
 
-def _get_font_size(rect: fitz.Rect, text: str) -> float:
-    """Choose a font size that fits the translated text into the original block."""
-    # Start close to the original block height and shrink until the text fits.
-    size = max(4.0, min(12.0, rect.height * 0.8))
-    return size
+def _get_font_size(rect: fitz.Rect) -> float:
+    """Choose a starting font size based on the original text block height."""
+    return max(4.0, min(12.0, rect.height * 0.8))
 
 
 def _insert_translation(page: fitz.Page, rect: fitz.Rect, text: str) -> bool:
-    """Insert translated text into rect using Noto Sans CJK KR, shrinking if needed."""
-    fontsize = _get_font_size(rect, text)
+    """Insert translated text using the embedded Noto Sans KR font."""
+    fontsize = _get_font_size(rect)
 
     while fontsize >= 4:
         result = page.insert_textbox(
             rect,
             text,
             fontsize=fontsize,
+            fontname=FONT_NAME,
             fontfile=str(FONT_PATH),
             color=(0, 0, 0),
             align=fitz.TEXT_ALIGN_LEFT,
@@ -60,13 +60,13 @@ def translate_pdf_file(
     """Translate PDF text blocks while preserving the existing page layout.
 
     The original text in each translated text block is redacted first, then the
-    translated text is inserted into the same rectangle using Noto Sans CJK KR.
-    Images, drawings, and the rest of the page are left intact.
+    translated text is inserted into the same rectangle using an embedded Noto
+    Sans KR font. Images, drawings, and the rest of the page are left intact.
     """
     if not FONT_PATH.exists():
         raise FileNotFoundError(
-            f"Noto Sans CJK KR font not found: {FONT_PATH}\n"
-            "Put NotoSansCJKkr-Regular.ttf in the fonts folder."
+            f"Noto Sans KR font not found: {FONT_PATH}\n"
+            "Put NotoSansKR-Regular.ttf in the fonts folder."
         )
 
     doc = fitz.open(input_pdf_path)
@@ -94,15 +94,16 @@ def translate_pdf_file(
                 print("원문:", text[:50])
                 print("번역:", translated[:50])
 
-            # Redact the original text only after collecting all blocks.
-            # Using redaction removes the old text from the page rather than
-            # merely drawing the translation on top of it.
+            # Remove the original text from the page first.
             for rect, _ in replacements:
                 page.add_redact_annot(rect, fill=(1, 1, 1))
 
             if replacements:
                 page.apply_redactions()
 
+            # IMPORTANT: when fontfile is supplied, fontname must be a new,
+            # non-reserved name. Using the default "helv" causes PyMuPDF to
+            # ignore the custom font file and use Helvetica instead.
             for rect, translated in replacements:
                 inserted = _insert_translation(page, rect, translated)
                 print("삽입 결과:", inserted)
@@ -110,7 +111,7 @@ def translate_pdf_file(
                 if inserted:
                     translated_count += 1
 
-        doc.save(output_pdf_path)
+        doc.save(output_pdf_path, garbage=4, deflate=True)
     finally:
         doc.close()
 
