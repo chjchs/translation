@@ -77,14 +77,9 @@ def _strip_mapping_markers(text: str) -> str:
 
 
 def _normalize_boundary_whitespace(text: str) -> str:
-    """Remove only whitespace directly adjacent to formatting tags.
-
-    The space belonging to the sentence is preserved. The purpose is to avoid
-    carrying XML-boundary padding into the PDF when DeepL returns spaces inside
-    <bold>/<italic> boundaries.
-    """
+    """Normalize whitespace around formatting tags without variable-length lookbehind."""
     text = re.sub(r"\s+(?=<\s*/?(?:bold|italic)\b)", "", text)
-    text = re.sub(r"(?<=</(?:bold|italic)>)\s+", " ", text)
+    text = re.sub(r"(</(?:bold|italic)>)\s+", r"\1 ", text)
     text = re.sub(r"(<(?:bold|italic)>)[ \t\u00a0]+", r"\1", text)
     text = re.sub(r"[ \t\u00a0]+(</(?:bold|italic)>)", r"\1", text)
     return text
