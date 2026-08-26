@@ -16,7 +16,7 @@ FONT_BOLD_PATH = FONT_DIR / "NotoSansKR-Bold.ttf"
 FONT_NAME = "NotoSansKR"
 FONT_BOLD_NAME = "NotoSansKRBold"
 RETRIES = 3
-TRANSLATION_DELAY = 3
+TRANSLATION_DELAY = 1
 RETRY_BACKOFF = 3
 
 
@@ -36,8 +36,17 @@ def _escape_xml_text(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def _span_style_flags(span: dict[str, Any]) -> tuple[bool, bool, bool]:
+    flags = int(span.get("flags", 0) or 0)
+    font = str(span.get("font", "")).lower()
+    bold = bool(flags & 16) or "bold" in font
+    italic = bool(flags & 2) or "italic" in font or "oblique" in font
+    color = int(span.get("color", 0) or 0) != 0
+    return bold, italic, color
+
+
 def _build_tagged_text(group: dict[str, Any]) -> tuple[str, dict[str, dict[str, Any]]]:
-    """Wrap every original span in a stable XML tag so DeepL preserves span boundaries."""
+    """Build one whole-group string. Style tags are inline markers, not separate translation requests."""
     span_meta: dict[str, dict[str, Any]] = {}
     chunks: list[str] = []
     tag_index = 0
@@ -49,26 +58,44 @@ def _build_tagged_text(group: dict[str, Any]) -> tuple[str, dict[str, dict[str, 
             raw = str(span.get("text", ""))
             if not raw:
                 continue
+
             tag = f"s{tag_index}"
             tag_index += 1
             span_meta[tag] = span
-            chunks.append(f"<{tag}>{_escape_xml_text(raw)}</{tag}>")
+            bold, italic, color = _span_style_flags(span)
+
+            # The entire group is sent in a single DeepL request. These XML tags
+            # are metadata around the text, so DeepL translates the text inside them.
+            opening: list[str] = []
+            closing: list[str] = []
+            if bold:
+                opening.append("<bold>")
+                closing.insert(0, "</bold>")
+            if italic:
+                opening.append("<italic>")
+                closing.insert(0, "</italic>")
+            if color:
+                opening.append(f"<color_{int(span.get('color', 0) or 0)}>")
+                closing.insert(0, f"</color_{int(span.get('color', 0) or 0)}>")
+
+            # Stable span tag lets us map translated text back to the original bbox.
+            chunks.append(f"<{tag}>" + "".join(opening) + _escape_xml_text(raw) + "".join(closing) + f"</{tag}>")
 
     return "".join(chunks), span_meta
 
 
 def _parse_tagged_translation(value: str, span_meta: dict[str, dict[str, Any]]) -> dict[str, str]:
-    """Extract DeepL's translated text for each preserved span tag."""
     root = ET.fromstring(f"<root>{value}</root>")
     result: dict[str, str] = {}
     for element in root.iter():
-        if element.tag in span_meta:
-            result[element.tag] = "".join(element.itertext())
+        if element.tag not in span_meta:
+            continue
+        result[element.tag] = "".join(element.itertext())
     return result
 
 
 def translate_text_blocks(text: str, source_lang: str = "auto", target_lang: str = "ko", tagged: bool = False) -> tuple[str, bool]:
-    """Translate one logical group with DeepL. Returns (text, success)."""
+    """Translate one logical group with DeepL. Returns (result, success)."""
     if not text.strip():
         return text, False
 
@@ -82,14 +109,16 @@ def translate_text_blocks(text: str, source_lang: str = "auto", target_lang: str
 
     for attempt in range(RETRIES):
         try:
-            result = translator.translate_text(
-                text,
-                source_lang=source,
-                target_lang=target,
-                tag_handling="xml" if tagged else None,
-                outline_detection=False if tagged else None,
-                preserve_formatting=True,
-            )
+            kwargs: dict[str, Any] = {
+                "source_lang": source,
+                "target_lang": target,
+                "preserve_formatting": True,
+            }
+            if tagged:
+                kwargs["tag_handling"] = "xml"
+                kwargs["outline_detection"] = False
+
+            result = translator.translate_text(text, **kwargs)
             translated = str(result.text).strip()
             if translated:
                 return translated, True
@@ -148,8 +177,9 @@ def _copy_images(doc: fitz.Document, page: fitz.Page, images: list[dict[str, Any
 
 def _span_style(span: dict[str, Any]) -> tuple[str, tuple[float, float, float], bool, bool]:
     flags = int(span.get("flags", 0) or 0)
-    bold = bool(flags & 16) or "bold" in str(span.get("font", "")).lower()
-    italic = bool(flags & 2) or "italic" in str(span.get("font", "")).lower() or "oblique" in str(span.get("font", "")).lower()
+    font = str(span.get("font", "")).lower()
+    bold = bool(flags & 16) or "bold" in font
+    italic = bool(flags & 2) or "italic" in font or "oblique" in font
     color_value = int(span.get("color", 0) or 0)
     try:
         rgb = fitz.sRGB_to_rgb(color_value)
@@ -182,9 +212,7 @@ def _insert_span(page: fitz.Page, span: dict[str, Any], text: str) -> bool:
         return True
     rect = fitz.Rect(span["bbox"])
     size = max(4.0, float(span.get("size", 12) or 12))
-    font_name, color, _, italic = _span_style(span)
-    # PyMuPDF's built-in textbox insertion does not expose an italic font face here;
-    # use the available regular/bold Noto Sans KR face while preserving bold/color.
+    font_name, color, _, _ = _span_style(span)
     while size >= 4:
         result = page.insert_textbox(rect, text, fontsize=size, fontname=font_name, fontfile=str(FONT_BOLD_PATH if font_name == FONT_BOLD_NAME else FONT_PATH), color=color, align=fitz.TEXT_ALIGN_LEFT, overlay=True)
         if result >= 0:
@@ -248,7 +276,6 @@ def translate_pdf_file(input_pdf_path: str, output_pdf_path: str, source_lang: s
                     inserted = _insert_group(translated_page, group, translated, tagged_translation=True)
                     display_translation = translated[:200]
                 else:
-                    # Translation failure: insert the original text, preserving its span styles.
                     print("번역 실패, 원문 그대로 삽입:", text[:200])
                     inserted = _insert_group(translated_page, group, tagged_text, tagged_translation=True)
                     display_translation = text[:200]
