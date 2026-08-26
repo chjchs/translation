@@ -37,10 +37,15 @@ def _escape_xml_text(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _span_style_flags(span: dict[str, Any]) -> tuple[bool, bool]:
+def _span_style_flags(span: dict[str, Any]) -> tuple[bool, bool, bool]:
     flags = int(span.get("flags", 0) or 0)
+    char_flags = int(span.get("char_flags", 0) or 0)
     font = str(span.get("font", "")).lower()
-    return bool(flags & 16) or "bold" in font, bool(flags & 2) or "italic" in font or "oblique" in font
+    bold = bool(flags & 16) or "bold" in font
+    italic = bool(flags & 2) or "italic" in font or "oblique" in font
+    # PyMuPDF stores underline as bit 1 of char_flags, not in font flags.
+    underline = bool(char_flags & 2)
+    return bold, italic, underline
 
 
 def _build_tagged_text(group: dict[str, Any]) -> tuple[str, dict[str, dict[str, Any]]]:
@@ -58,9 +63,17 @@ def _build_tagged_text(group: dict[str, Any]) -> tuple[str, dict[str, dict[str, 
                 continue
             key = f"s{span_index}"
             span_meta[key] = span
-            bold, italic = _span_style_flags(span)
-            opening = ("<bold>" if bold else "") + ("<italic>" if italic else "")
-            closing = ("</italic>" if italic else "") + ("</bold>" if bold else "")
+            bold, italic, underline = _span_style_flags(span)
+            opening = (
+                ("<bold>" if bold else "")
+                + ("<italic>" if italic else "")
+                + ("<underline>" if underline else "")
+            )
+            closing = (
+                ("</underline>" if underline else "")
+                + ("</italic>" if italic else "")
+                + ("</bold>" if bold else "")
+            )
             marker = f"[[MAP_{token}_{span_index}]]"
             chunks.append(opening + _escape_xml_text(raw) + closing + marker)
             span_index += 1
@@ -69,7 +82,7 @@ def _build_tagged_text(group: dict[str, Any]) -> tuple[str, dict[str, dict[str, 
 
 
 def _strip_format_tags(text: str) -> str:
-    return re.sub(r"</?(?:bold|italic)(?:\s+[^>]*)?>", "", text)
+    return re.sub(r"</?(?:bold|italic|underline)(?:\s+[^>]*)?>", "", text)
 
 
 def _strip_mapping_markers(text: str) -> str:
@@ -78,10 +91,10 @@ def _strip_mapping_markers(text: str) -> str:
 
 def _normalize_boundary_whitespace(text: str) -> str:
     """Normalize whitespace around formatting tags without variable-length lookbehind."""
-    text = re.sub(r"\s+(?=<\s*/?(?:bold|italic)\b)", "", text)
-    text = re.sub(r"(</(?:bold|italic)>)\s+", r"\1 ", text)
-    text = re.sub(r"(<(?:bold|italic)>)[ \t\u00a0]+", r"\1", text)
-    text = re.sub(r"[ \t\u00a0]+(</(?:bold|italic)>)", r"\1", text)
+    text = re.sub(r"\s+(?=<\s*/?(?:bold|italic|underline)\b)", "", text)
+    text = re.sub(r"(</(?:bold|italic|underline)>)\s+", r"\1 ", text)
+    text = re.sub(r"(<(?:bold|italic|underline)>)[ \t\u00a0]+", r"\1", text)
+    text = re.sub(r"[ \t\u00a0]+(</(?:bold|italic|underline)>)", r"\1", text)
     return text
 
 
@@ -127,7 +140,11 @@ def translate_text_blocks(text: str, source_lang: str = "auto", target_lang: str
     if not api_key:
         raise RuntimeError("DEEPL_API_KEY environment variable is not set")
     translator = deepl.DeepLClient(api_key)
-    kwargs: dict[str, Any] = {"source_lang": _deepl_source_language(source_lang), "target_lang": _deepl_target_language(target_lang), "preserve_formatting": True}
+    kwargs: dict[str, Any] = {
+        "source_lang": _deepl_source_language(source_lang),
+        "target_lang": _deepl_target_language(target_lang),
+        "preserve_formatting": True,
+    }
     if tagged:
         kwargs["tag_handling"] = "xml"
         kwargs["outline_detection"] = False
@@ -147,7 +164,13 @@ def translate_text_blocks(text: str, source_lang: str = "auto", target_lang: str
 
 def _get_span_info(page: fitz.Page) -> list[dict[str, Any]]:
     result = []
-    data = page.get_text("dict")
+    text_flags = getattr(fitz, "TEXTFLAGS_DICT", None)
+    collect_styles = getattr(fitz, "TEXT_COLLECT_STYLES", 32768)
+    if text_flags is not None:
+        text_flags |= collect_styles
+        data = page.get_text("dict", flags=text_flags)
+    else:
+        data = page.get_text("dict")
     for bi, block in enumerate(data.get("blocks", [])):
         if block.get("type") != 0:
             continue
@@ -159,7 +182,15 @@ def _get_span_info(page: fitz.Page) -> list[dict[str, Any]]:
             if not text:
                 continue
             dominant = max(spans, key=lambda s: float(s.get("size", 12) or 12))
-            result.append({"text": text, "bbox": fitz.Rect(line["bbox"]), "size": float(dominant.get("size", 12) or 12), "spans": spans, "block_index": bi, "line_index": li, "dir": tuple(line.get("dir", (1.0, 0.0)))})
+            result.append({
+                "text": text,
+                "bbox": fitz.Rect(line["bbox"]),
+                "size": float(dominant.get("size", 12) or 12),
+                "spans": spans,
+                "block_index": bi,
+                "line_index": li,
+                "dir": tuple(line.get("dir", (1.0, 0.0))),
+            })
     return result
 
 
@@ -187,18 +218,20 @@ def _copy_images(doc: fitz.Document, page: fitz.Page, images: list[dict[str, Any
     return count
 
 
-def _span_style(span: dict[str, Any]) -> tuple[str, tuple[float, float, float], bool, bool]:
+def _span_style(span: dict[str, Any]) -> tuple[str, tuple[float, float, float], bool, bool, bool]:
     flags = int(span.get("flags", 0) or 0)
+    char_flags = int(span.get("char_flags", 0) or 0)
     font = str(span.get("font", "")).lower()
     bold = bool(flags & 16) or "bold" in font
     italic = bool(flags & 2) or "italic" in font or "oblique" in font
+    underline = bool(char_flags & 2)
     color_value = int(span.get("color", 0) or 0)
     try:
         rgb = fitz.sRGB_to_rgb(color_value)
         color = tuple(v / 255 for v in rgb)
     except Exception:
         color = (0.0, 0.0, 0.0)
-    return (FONT_BOLD_NAME if bold else FONT_NAME, color, bold, italic)
+    return (FONT_BOLD_NAME if bold else FONT_NAME, color, bold, italic, underline)
 
 
 def _style(group: dict[str, Any]) -> dict[str, Any]:
@@ -219,15 +252,42 @@ def _align(group: dict[str, Any], page_rect: fitz.Rect) -> int:
     return fitz.TEXT_ALIGN_LEFT
 
 
+def _draw_underline(page: fitz.Page, span: dict[str, Any], color: tuple[float, float, float]) -> None:
+    rect = fitz.Rect(span["bbox"])
+    size = max(4.0, float(span.get("size", 12) or 12))
+    y = rect.y1 - max(0.8, size * 0.08)
+    try:
+        page.draw_line(
+            fitz.Point(rect.x0, y),
+            fitz.Point(rect.x1, y),
+            color=color,
+            width=max(0.5, size * 0.055),
+            overlay=True,
+        )
+    except Exception as exc:
+        print(f"밑줄 삽입 실패: {exc}")
+
+
 def _insert_span(page: fitz.Page, span: dict[str, Any], text: str) -> bool:
     if not text:
         return True
     rect = fitz.Rect(span["bbox"])
     size = max(4.0, float(span.get("size", 12) or 12))
-    font_name, color, _, _ = _span_style(span)
+    font_name, color, _, _, underline = _span_style(span)
     while size >= 4:
-        result = page.insert_textbox(rect, text, fontsize=size, fontname=font_name, fontfile=str(FONT_BOLD_PATH if font_name == FONT_BOLD_NAME else FONT_PATH), color=color, align=fitz.TEXT_ALIGN_LEFT, overlay=True)
+        result = page.insert_textbox(
+            rect,
+            text,
+            fontsize=size,
+            fontname=font_name,
+            fontfile=str(FONT_BOLD_PATH if font_name == FONT_BOLD_NAME else FONT_PATH),
+            color=color,
+            align=fitz.TEXT_ALIGN_LEFT,
+            overlay=True,
+        )
         if result >= 0:
+            if underline:
+                _draw_underline(page, span, color)
             return True
         size -= .5
     return False
@@ -252,7 +312,16 @@ def _insert_group(page: fitz.Page, group: dict[str, Any], translated: str, tagge
     rect = fitz.Rect(group["bbox"])
     size = max(4.0, style["size"])
     while size >= 4:
-        result = page.insert_textbox(rect, clean_text, fontsize=size, fontname=FONT_NAME, fontfile=str(FONT_PATH), color=(0, 0, 0), align=_align(group, page.rect), overlay=True)
+        result = page.insert_textbox(
+            rect,
+            clean_text,
+            fontsize=size,
+            fontname=FONT_NAME,
+            fontfile=str(FONT_PATH),
+            color=(0, 0, 0),
+            align=_align(group, page.rect),
+            overlay=True,
+        )
         if result >= 0:
             return True
         size -= .5
