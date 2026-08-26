@@ -15,6 +15,7 @@ FONT_NAME = "NotoSansKR"
 FONT_BOLD_NAME = "NotoSansKRBold"
 RETRIES = 3
 TRANSLATION_DELAY = 3
+RETRY_BACKOFF = 3
 ERROR_MARKERS = ("error 500", "server error", "that's an error", "that’s an error", "there was an error", "please try again later")
 
 
@@ -22,12 +23,14 @@ def _google_error(value: Any) -> bool:
     if not value:
         return True
     value = str(value).strip().lower()
-    return any(x in value for x in ERROR_MARKERS)
+    return any(marker in value for marker in ERROR_MARKERS)
 
 
 def translate_text_blocks(text: str, source_lang: str = "auto", target_lang: str = "ko") -> str:
+    """Translate one logical group, with throttled retries for transient Google errors."""
     if not text.strip():
         return text
+
     for attempt in range(RETRIES):
         try:
             result = GoogleTranslator(source=source_lang, target=target_lang).translate(text)
@@ -36,6 +39,11 @@ def translate_text_blocks(text: str, source_lang: str = "auto", target_lang: str
             raise RuntimeError("Google Translate returned an empty response or an error-page response")
         except Exception as exc:
             print(f"번역 group 실패 (시도 {attempt + 1}/{RETRIES}): {exc}")
+            if attempt < RETRIES - 1:
+                delay = RETRY_BACKOFF * (attempt + 1)
+                print(f"재시도 전 {delay}초 대기...")
+                time.sleep(delay)
+
     return text
 
 
@@ -56,8 +64,13 @@ def _get_span_info(page: fitz.Page) -> list[dict[str, Any]]:
             flags = int(dominant.get("flags", 0) or 0)
             color = int(dominant.get("color", 0) or 0)
             result.append({
-                "text": text, "bbox": fitz.Rect(line["bbox"]), "size": float(dominant.get("size", 12) or 12),
-                "spans": spans, "block_index": bi, "line_index": li, "dir": tuple(line.get("dir", (1.0, 0.0))),
+                "text": text,
+                "bbox": fitz.Rect(line["bbox"]),
+                "size": float(dominant.get("size", 12) or 12),
+                "spans": spans,
+                "block_index": bi,
+                "line_index": li,
+                "dir": tuple(line.get("dir", (1.0, 0.0))),
                 "color": (((color >> 16) & 255) / 255, ((color >> 8) & 255) / 255, (color & 255) / 255),
                 "bold": bool(flags & 16) or "bold" in str(dominant.get("font", "")).lower(),
                 "italic": bool(flags & 2) or "italic" in str(dominant.get("font", "")).lower(),
@@ -121,7 +134,16 @@ def _insert_group(page: fitz.Page, group: dict[str, Any], text: str) -> bool:
     rect = fitz.Rect(group["bbox"])
     size = max(4.0, style["size"])
     while size >= 4:
-        result = page.insert_textbox(rect, text, fontsize=size, fontname=FONT_BOLD_NAME if bold else FONT_NAME, fontfile=str(FONT_BOLD_PATH if bold else FONT_PATH), color=style["color"], align=_align(group, page.rect), overlay=True)
+        result = page.insert_textbox(
+            rect,
+            text,
+            fontsize=size,
+            fontname=FONT_BOLD_NAME if bold else FONT_NAME,
+            fontfile=str(FONT_BOLD_PATH if bold else FONT_PATH),
+            color=style["color"],
+            align=_align(group, page.rect),
+            overlay=True,
+        )
         if result >= 0:
             return True
         size -= .5
@@ -144,13 +166,21 @@ def translate_pdf_file(input_pdf_path: str, output_pdf_path: str, source_lang: s
             image_count += _copy_images(source_doc, translated_page, image_list)
             print(f"페이지 {page_number}: {len(lines)} lines -> {len(groups)} groups")
 
+            request_made = False
             for group_index, group in enumerate(groups):
                 text = str(group.get("text", "")).strip()
                 if len(text) < 2:
                     continue
+
+                if request_made:
+                    time.sleep(TRANSLATION_DELAY)
+
                 translated = translate_text_blocks(text, source_lang, target_lang)
+                request_made = True
                 if translated == text:
+                    print("번역 실패, 원문 유지:", text[:200])
                     continue
+
                 inserted = _insert_group(translated_page, group, translated)
                 print(f"그룹 {group_index} ({group.get('group_type')}): {len(group.get('lines', []))} lines")
                 print("원문:", text[:200])
@@ -158,7 +188,6 @@ def translate_pdf_file(input_pdf_path: str, output_pdf_path: str, source_lang: s
                 print("삽입 결과:", inserted, "direction:", group.get("direction"), "bbox:", group.get("bbox"))
                 if inserted:
                     translated_count += 1
-                time.sleep(TRANSLATION_DELAY)
 
             original_page = output_doc.new_page(width=source_page.rect.width, height=source_page.rect.height)
             original_page.show_pdf_page(original_page.rect, source_doc, source_page.number)
