@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Iterable
+import time
 
 import fitz
 from deep_translator import GoogleTranslator
@@ -13,6 +14,7 @@ FONT_BOLD_PATH = FONT_DIR / "NotoSansKR-Bold.ttf"
 FONT_NAME = "NotoSansKR"
 FONT_BOLD_NAME = "NotoSansKRBold"
 RETRIES = 3
+TRANSLATION_DELAY = 3
 ERROR_MARKERS = ("error 500", "server error", "that's an error", "that’s an error", "there was an error", "please try again later")
 
 
@@ -156,6 +158,7 @@ def translate_pdf_file(input_pdf_path: str, output_pdf_path: str, source_lang: s
                 print("삽입 결과:", inserted, "direction:", group.get("direction"), "bbox:", group.get("bbox"))
                 if inserted:
                     translated_count += 1
+                time.sleep(TRANSLATION_DELAY)
 
             original_page = output_doc.new_page(width=source_page.rect.width, height=source_page.rect.height)
             original_page.show_pdf_page(original_page.rect, source_doc, source_page.number)
