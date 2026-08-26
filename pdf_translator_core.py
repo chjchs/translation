@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -39,19 +40,19 @@ def _escape_xml_text(text: str) -> str:
 def _span_style_flags(span: dict[str, Any]) -> tuple[bool, bool]:
     flags = int(span.get("flags", 0) or 0)
     font = str(span.get("font", "")).lower()
-    bold = bool(flags & 16) or "bold" in font
-    italic = bool(flags & 2) or "italic" in font or "oblique" in font
-    return bold, italic
+    return bool(flags & 16) or "bold" in font, bool(flags & 2) or "italic" in font or "oblique" in font
 
 
 def _build_tagged_text(group: dict[str, Any]) -> tuple[str, dict[str, dict[str, Any]]]:
-    """Build the complete group as one DeepL request with inline style tags.
+    """Build one complete group for DeepL.
 
-    [[SPAN_n]] markers are plain-text sentinels used only to map the translated
-    pieces back to their original PDF spans. They are never used as XML tags.
+    DeepL receives the complete sentence/group in one request. Formatting is
+    expressed inline with <bold>/<italic>. A unique marker is appended only as
+    an invisible mapping sentinel; it is never used to split translation calls.
     """
     span_meta: dict[str, dict[str, Any]] = {}
     chunks: list[str] = []
+    token = uuid.uuid4().hex[:10]
     span_index = 0
 
     for line_index, line in enumerate(group.get("lines", [])):
@@ -64,16 +65,12 @@ def _build_tagged_text(group: dict[str, Any]) -> tuple[str, dict[str, dict[str, 
             key = f"s{span_index}"
             span_meta[key] = span
             bold, italic = _span_style_flags(span)
-            opening: list[str] = []
-            closing: list[str] = []
-            if bold:
-                opening.append("<bold>")
-                closing.insert(0, "</bold>")
-            if italic:
-                opening.append("<italic>")
-                closing.insert(0, "</italic>")
-            marker = f"[[SPAN_{span_index}]]"
-            chunks.append("".join(opening) + marker + _escape_xml_text(raw) + "".join(closing))
+            opening = ("<bold>" if bold else "") + ("<italic>" if italic else "")
+            closing = ("</italic>" if italic else "") + ("</bold>" if bold else "")
+            # Put the sentinel AFTER the text rather than before it. DeepL is
+            # much less likely to treat it as a leading word/spacing boundary.
+            marker = f"[[MAP_{token}_{span_index}]]"
+            chunks.append(opening + _escape_xml_text(raw) + marker + closing)
             span_index += 1
 
     return "".join(chunks), span_meta
@@ -83,25 +80,41 @@ def _strip_format_tags(text: str) -> str:
     return re.sub(r"</?(?:bold|italic)(?:\s+[^>]*)?>", "", text)
 
 
-def _strip_span_markers(text: str) -> str:
-    return re.sub(r"\[\[SPAN_\d+\]\]", "", text)
+def _strip_mapping_markers(text: str) -> str:
+    return re.sub(r"\[\[MAP_[A-Za-z0-9]+_\d+\]\]", "", text)
 
 
 def _parse_tagged_translation(value: str, span_meta: dict[str, dict[str, Any]]) -> dict[str, str]:
-    """Split one translated group by the preserved [[SPAN_n]] markers."""
+    """Map the single translated group back to its original spans.
+
+    Handles markers that DeepL preserves, including repeated numbering from
+    separately translated groups, because each request gets a unique token.
+    """
+    matches = list(re.finditer(r"\[\[MAP_([A-Za-z0-9]+)_(\d+)\]\]", value))
+    if not matches:
+        raise ValueError("DeepL removed all mapping markers")
+
     result: dict[str, str] = {}
-    for index, key in enumerate(span_meta):
-        marker = f"[[SPAN_{index}]]"
-        start = value.find(marker)
-        if start < 0:
+    expected_token = matches[0].group(1)
+    for match in matches:
+        if match.group(1) != expected_token:
             continue
-        start += len(marker)
-        next_marker = value.find(f"[[SPAN_{index + 1}]]", start)
-        end = next_marker if next_marker >= 0 else len(value)
-        piece = value[start:end]
+        index = int(match.group(2))
+        key = f"s{index}"
+        if key not in span_meta:
+            continue
+        start = matches[matches.index(match) - 1].end() if matches.index(match) > 0 else 0
+        # Only use the text since the previous marker. This preserves normal
+        # spaces exactly as DeepL returned them instead of inventing spaces.
+        piece = value[start:match.start()]
         piece = _strip_format_tags(piece)
-        # A marker should identify a span, not contribute whitespace to it.
+        if index == 0:
+            piece = piece.lstrip("\n")
         result[key] = piece
+
+    if len(result) != len(span_meta):
+        missing = [k for k in span_meta if k not in result]
+        raise ValueError(f"DeepL did not preserve all mapping markers: {missing}")
     return result
 
 
@@ -112,11 +125,7 @@ def translate_text_blocks(text: str, source_lang: str = "auto", target_lang: str
     if not api_key:
         raise RuntimeError("DEEPL_API_KEY environment variable is not set")
     translator = deepl.DeepLClient(api_key)
-    kwargs: dict[str, Any] = {
-        "source_lang": _deepl_source_language(source_lang),
-        "target_lang": _deepl_target_language(target_lang),
-        "preserve_formatting": True,
-    }
+    kwargs: dict[str, Any] = {"source_lang": _deepl_source_language(source_lang), "target_lang": _deepl_target_language(target_lang), "preserve_formatting": True}
     if tagged:
         kwargs["tag_handling"] = "xml"
         kwargs["outline_detection"] = False
@@ -130,9 +139,7 @@ def translate_text_blocks(text: str, source_lang: str = "auto", target_lang: str
         except Exception as exc:
             print(f"번역 group 실패 (시도 {attempt + 1}/{RETRIES}): {exc}")
             if attempt < RETRIES - 1:
-                delay = RETRY_BACKOFF * (attempt + 1)
-                print(f"재시도 전 {delay}초 대기...")
-                time.sleep(delay)
+                time.sleep(RETRY_BACKOFF * (attempt + 1))
     return text, False
 
 
@@ -229,17 +236,15 @@ def _insert_group(page: fitz.Page, group: dict[str, Any], translated: str, tagge
         try:
             _, span_meta = _build_tagged_text(group)
             translated_by_span = _parse_tagged_translation(translated, span_meta)
-            if len(translated_by_span) != len(span_meta):
-                raise ValueError("DeepL did not preserve all span markers")
             inserted_any = False
             for key, span in span_meta.items():
                 inserted_any = _insert_span(page, span, translated_by_span[key]) or inserted_any
             return inserted_any
         except Exception as exc:
             print(f"서식 매핑 실패, 마커 제거 후 그룹 단위 삽입으로 전환: {exc}")
-            clean_text = _strip_span_markers(_strip_format_tags(translated))
+            clean_text = _strip_mapping_markers(_strip_format_tags(translated))
     else:
-        clean_text = _strip_span_markers(_strip_format_tags(translated))
+        clean_text = _strip_mapping_markers(_strip_format_tags(translated))
 
     style = _style(group)
     rect = fitz.Rect(group["bbox"])
@@ -278,10 +283,12 @@ def translate_pdf_file(input_pdf_path: str, output_pdf_path: str, source_lang: s
                 request_made = True
                 if success:
                     inserted = _insert_group(translated_page, group, translated, tagged_translation=True)
-                    display_translation = _strip_span_markers(_strip_format_tags(translated))[:200]
+                    display_translation = _strip_mapping_markers(_strip_format_tags(translated))[:200]
                 else:
                     print("번역 실패, 원문 그대로 삽입:", text[:200])
-                    inserted = _insert_group(translated_page, group, tagged_text, tagged_translation=True)
+                    # Never insert mapping markers into the PDF on a failed request.
+                    clean_original = _strip_mapping_markers(_strip_format_tags(tagged_text))
+                    inserted = _insert_group(translated_page, group, clean_original, tagged_translation=False)
                     display_translation = text[:200]
                 print(f"그룹 {group_index} ({group.get('group_type')}): {len(group.get('lines', []))} lines")
                 print("원문:", text[:200])
