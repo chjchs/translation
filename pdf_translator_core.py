@@ -113,7 +113,7 @@ def _is_near_image(rect: fitz.Rect, image_rects: list[fitz.Rect]) -> tuple[bool,
 
 
 def _insert_translation(page: fitz.Page, rect: fitz.Rect, text: str, original_font_size: float) -> bool:
-    """Insert translated text without modifying the source page."""
+    """Insert translated text onto a newly-created blank page."""
     fontsize = max(4.0, original_font_size)
     while fontsize >= 4:
         result = page.insert_textbox(
@@ -131,39 +131,6 @@ def _insert_translation(page: fitz.Page, rect: fitz.Rect, text: str, original_fo
     return False
 
 
-def _render_translation_background(
-    source_page: fitz.Page,
-    replacements: list[tuple[fitz.Rect, str, float]],
-    dpi: int = 150,
-) -> tuple[bytes, float]:
-    """Render the original page to an image and mask only text that will be translated.
-
-    The source PDF page is never redacted or modified. The returned image becomes the
-    visual background of a newly-created output page, after which translations are
-    inserted as real PDF text.
-    """
-    scale = dpi / 72.0
-    matrix = fitz.Matrix(scale, scale)
-    pix = source_page.get_pixmap(matrix=matrix, alpha=False)
-
-    # Work on a temporary document so the raster background can be edited without
-    # touching the original page or its PDF objects.
-    image_doc = fitz.open()
-    try:
-        image_page = image_doc.new_page(width=source_page.rect.width, height=source_page.rect.height)
-        image_page.insert_image(source_page.rect, pixmap=pix)
-
-        # Mask only groups that actually have a different translation. Text inside
-        # images is never included because image-overlapping groups are skipped.
-        for rect, _, _ in replacements:
-            image_page.draw_rect(rect, color=None, fill=(1, 1, 1), overlay=True)
-
-        rendered = image_page.get_pixmap(matrix=matrix, alpha=False)
-        return rendered.tobytes("png"), scale
-    finally:
-        image_doc.close()
-
-
 def translate_pdf_file(
     input_pdf_path: str,
     output_pdf_path: str,
@@ -171,17 +138,16 @@ def translate_pdf_file(
     target_lang: str = "ko",
     debug_grouping: bool = False,
 ) -> int:
-    """Translate each source page onto a newly-created page.
+    """Create completely new blank pages and place translations directly on them.
 
-    Unlike the old implementation, the original page is never redacted, recolored,
-    or otherwise modified. For every source page we create a fresh page, use a
-    rasterized copy of the source as its visual background, mask only the text groups
-    being replaced, and insert the Korean translations as a new text layer.
+    The source PDF is used only for analysis. Its pages are never rendered, copied,
+    redacted, or used as visual backgrounds. Each output page starts blank and the
+    translated logical groups are inserted at their original coordinates.
     """
     if not FONT_PATH.exists():
         raise FileNotFoundError(
             f"Noto Sans KR font not found: {FONT_PATH}\n"
-            "Put NotoSansKR-Regular.ttf in the fonts folder."
+            f"Put NotoSansKR-Regular.ttf in the fonts folder."
         )
 
     source_doc = fitz.open(input_pdf_path)
@@ -195,7 +161,14 @@ def translate_pdf_file(
             lines = _get_span_info(source_page)
             groups = group_page(source_page, lines, debug=debug_grouping)
             image_rects = _get_image_rects(source_page)
-            replacements: list[tuple[fitz.Rect, str, float]] = []
+
+            # IMPORTANT: this is a genuinely empty page. Nothing from source_page
+            # is copied into it. The source page is only queried for coordinates and
+            # grouping information.
+            output_page = output_doc.new_page(
+                width=source_page.rect.width,
+                height=source_page.rect.height,
+            )
 
             print(f"페이지 {page_number}: {len(lines)} lines -> {len(groups)} logical groups")
 
@@ -226,33 +199,21 @@ def translate_pdf_file(
                     continue
 
                 original_font_size = max(4.0, float(item.get("size", 12.0)))
-                replacements.append((rect, translated, original_font_size))
+                inserted = _insert_translation(
+                    output_page,
+                    rect,
+                    translated,
+                    original_font_size,
+                )
 
                 print("원문:", text[:120])
                 print("번역:", translated[:120])
+                print("삽입 결과:", inserted)
                 print("group type:", item.get("group_type"))
                 print("group bbox:", rect)
                 if near_image and nearest_image is not None:
                     print("nearest image bbox:", nearest_image)
 
-            # Every output page is created independently. The source page remains
-            # untouched in source_doc for the entire operation.
-            output_page = output_doc.new_page(
-                width=source_page.rect.width,
-                height=source_page.rect.height,
-            )
-
-            if replacements:
-                background_png, _ = _render_translation_background(source_page, replacements)
-                output_page.insert_image(output_page.rect, stream=background_png)
-            else:
-                # Pages without translations are copied visually as-is.
-                pix = source_page.get_pixmap(matrix=fitz.Matrix(150 / 72.0, 150 / 72.0), alpha=False)
-                output_page.insert_image(output_page.rect, pixmap=pix)
-
-            for rect, translated, original_font_size in replacements:
-                inserted = _insert_translation(output_page, rect, translated, original_font_size)
-                print("삽입 결과:", inserted)
                 if inserted:
                     translated_count += 1
 
@@ -263,7 +224,7 @@ def translate_pdf_file(
 
     print("이미지와 겹쳐 건너뛴 텍스트:", skipped_image_count)
     print("이미지와 가깝지만 바깥에 있어 번역한 텍스트:", translated_near_image_count)
-    print("원본 페이지는 수정하지 않고 새 페이지에 번역 결과를 생성했습니다.")
+    print("빈 페이지를 생성하고 번역문만 직접 삽입했습니다.")
     return translated_count
 
 
