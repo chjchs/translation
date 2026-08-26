@@ -1,42 +1,83 @@
 from __future__ import annotations
 
+import os
+import time
 from pathlib import Path
 from typing import Any, Iterable
-import time
 
 import fitz
-from deep_translator import GoogleTranslator
+import deepl
 from grouping_engine import group_page
 
 FONT_DIR = Path(__file__).resolve().parent / "fonts"
 FONT_PATH = FONT_DIR / "NotoSansKR-Regular.ttf"
-FONT_BOLD_PATH = FONT_DIR / "NotoSansKR-Bold.ttf"
 FONT_NAME = "NotoSansKR"
-FONT_BOLD_NAME = "NotoSansKRBold"
 RETRIES = 3
 TRANSLATION_DELAY = 3
 RETRY_BACKOFF = 3
-ERROR_MARKERS = ("error 500", "server error", "that's an error", "that’s an error", "there was an error", "please try again later")
 
 
-def _google_error(value: Any) -> bool:
-    if not value:
-        return True
-    value = str(value).strip().lower()
-    return any(marker in value for marker in ERROR_MARKERS)
+def _deepl_target_language(target_lang: str) -> str:
+    mapping = {
+        "ko": "KO",
+        "en": "EN-US",
+        "ja": "JA",
+        "zh": "ZH",
+        "zh-cn": "ZH",
+        "fr": "FR",
+        "de": "DE",
+        "es": "ES",
+        "it": "IT",
+        "pt": "PT-PT",
+        "pt-br": "PT-BR",
+        "ru": "RU",
+    }
+    return mapping.get(target_lang.lower(), target_lang.upper())
+
+
+def _deepl_source_language(source_lang: str) -> str | None:
+    if not source_lang or source_lang.lower() == "auto":
+        return None
+    mapping = {
+        "ko": "KO",
+        "en": "EN",
+        "ja": "JA",
+        "zh": "ZH",
+        "zh-cn": "ZH",
+        "fr": "FR",
+        "de": "DE",
+        "es": "ES",
+        "it": "IT",
+        "pt": "PT",
+        "ru": "RU",
+    }
+    return mapping.get(source_lang.lower(), source_lang.upper())
 
 
 def translate_text_blocks(text: str, source_lang: str = "auto", target_lang: str = "ko") -> str:
-    """Translate one logical group, with throttled retries for transient Google errors."""
+    """Translate one logical group using the DeepL API."""
     if not text.strip():
         return text
 
+    api_key = os.getenv("DEEPL_API_KEY")
+    if not api_key:
+        raise RuntimeError("DEEPL_API_KEY environment variable is not set")
+
+    translator = deepl.DeepLClient(api_key)
+    target = _deepl_target_language(target_lang)
+    source = _deepl_source_language(source_lang)
+
     for attempt in range(RETRIES):
         try:
-            result = GoogleTranslator(source=source_lang, target=target_lang).translate(text)
-            if result and not _google_error(result):
-                return result
-            raise RuntimeError("Google Translate returned an empty response or an error-page response")
+            result = translator.translate_text(
+                text,
+                source_lang=source,
+                target_lang=target,
+            )
+            translated = str(result.text).strip()
+            if translated:
+                return translated
+            raise RuntimeError("DeepL returned an empty response")
         except Exception as exc:
             print(f"번역 group 실패 (시도 {attempt + 1}/{RETRIES}): {exc}")
             if attempt < RETRIES - 1:
