@@ -61,8 +61,6 @@ def _get_span_info(page: fitz.Page) -> list[dict[str, Any]]:
             if not text:
                 continue
             dominant = max(spans, key=lambda s: float(s.get("size", 12) or 12))
-            flags = int(dominant.get("flags", 0) or 0)
-            color = int(dominant.get("color", 0) or 0)
             result.append({
                 "text": text,
                 "bbox": fitz.Rect(line["bbox"]),
@@ -71,9 +69,6 @@ def _get_span_info(page: fitz.Page) -> list[dict[str, Any]]:
                 "block_index": bi,
                 "line_index": li,
                 "dir": tuple(line.get("dir", (1.0, 0.0))),
-                "color": (((color >> 16) & 255) / 255, ((color >> 8) & 255) / 255, (color & 255) / 255),
-                "bold": bool(flags & 16) or "bold" in str(dominant.get("font", "")).lower(),
-                "italic": bool(flags & 2) or "italic" in str(dominant.get("font", "")).lower(),
             })
     return result
 
@@ -105,17 +100,9 @@ def _copy_images(doc: fitz.Document, page: fitz.Page, images: list[dict[str, Any
 def _style(group: dict[str, Any]) -> dict[str, Any]:
     spans = group.get("spans", [])
     if not spans:
-        return {"size": 12.0, "color": (0, 0, 0), "bold": False, "italic": False}
+        return {"size": 12.0}
     s = max(spans, key=lambda x: float(x.get("size", 12) or 12))
-    flags = int(s.get("flags", 0) or 0)
-    color = int(s.get("color", 0) or 0)
-    font = str(s.get("font", ""))
-    return {
-        "size": float(s.get("size", 12) or 12),
-        "color": (((color >> 16) & 255) / 255, ((color >> 8) & 255) / 255, (color & 255) / 255),
-        "bold": bool(flags & 16) or "bold" in font.lower(),
-        "italic": bool(flags & 2) or "italic" in font.lower(),
-    }
+    return {"size": float(s.get("size", 12) or 12)}
 
 
 def _align(group: dict[str, Any], page_rect: fitz.Rect) -> int:
@@ -130,7 +117,6 @@ def _align(group: dict[str, Any], page_rect: fitz.Rect) -> int:
 
 def _insert_group(page: fitz.Page, group: dict[str, Any], text: str) -> bool:
     style = _style(group)
-    bold = style["bold"] and FONT_BOLD_PATH.exists()
     rect = fitz.Rect(group["bbox"])
     size = max(4.0, style["size"])
     while size >= 4:
@@ -138,9 +124,9 @@ def _insert_group(page: fitz.Page, group: dict[str, Any], text: str) -> bool:
             rect,
             text,
             fontsize=size,
-            fontname=FONT_BOLD_NAME if bold else FONT_NAME,
-            fontfile=str(FONT_BOLD_PATH if bold else FONT_PATH),
-            color=style["color"],
+            fontname=FONT_NAME,
+            fontfile=str(FONT_PATH),
+            color=(0, 0, 0),
             align=_align(group, page.rect),
             overlay=True,
         )
