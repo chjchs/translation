@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import os
 import re
 import time
@@ -43,7 +44,6 @@ def _span_style_flags(span: dict[str, Any]) -> tuple[bool, bool, bool]:
     font = str(span.get("font", "")).lower()
     bold = bool(flags & 16) or "bold" in font
     italic = bool(flags & 2) or "italic" in font or "oblique" in font
-    # PyMuPDF stores underline as bit 1 of char_flags, not in font flags.
     underline = bool(char_flags & 2)
     return bold, italic, underline
 
@@ -90,7 +90,6 @@ def _strip_mapping_markers(text: str) -> str:
 
 
 def _normalize_boundary_whitespace(text: str) -> str:
-    """Normalize whitespace around formatting tags without variable-length lookbehind."""
     text = re.sub(r"\s+(?=<\s*/?(?:bold|italic|underline)\b)", "", text)
     text = re.sub(r"(</(?:bold|italic|underline)>)\s+", r"\1 ", text)
     text = re.sub(r"(<(?:bold|italic|underline)>)[ \t\u00a0]+", r"\1", text)
@@ -120,8 +119,7 @@ def _parse_tagged_translation(value: str, span_meta: dict[str, dict[str, Any]]) 
         key = f"s{index}"
         if key not in span_meta:
             continue
-        piece = value[previous_end:match.start()]
-        piece = _clean_piece(piece)
+        piece = _clean_piece(value[previous_end:match.start()])
         if index == 0:
             piece = piece.lstrip("\n")
         result[key] = piece
@@ -131,6 +129,79 @@ def _parse_tagged_translation(value: str, span_meta: dict[str, dict[str, Any]]) 
         missing = [k for k in span_meta if k not in result]
         raise ValueError(f"DeepL did not preserve all mapping markers: {missing}")
     return result
+
+
+def _parse_tagged_html_parts(value: str, span_meta: dict[str, dict[str, Any]]) -> list[tuple[str, dict[str, Any]]]:
+    matches = list(re.finditer(r"\[\[MAP_([A-Za-z0-9]+)_(\d+)\]\]", value))
+    if not matches:
+        raise ValueError("DeepL removed all mapping markers")
+
+    expected_token = matches[0].group(1)
+    parts: list[tuple[str, dict[str, Any]]] = []
+    previous_end = 0
+    for match in matches:
+        if match.group(1) != expected_token:
+            continue
+        index = int(match.group(2))
+        key = f"s{index}"
+        if key not in span_meta:
+            continue
+        piece = value[previous_end:match.start()]
+        piece = _normalize_boundary_whitespace(piece)
+        # The tags have already been validated by DeepL's XML handling. Escape
+        # text again only after converting our private tags to HTML below.
+        parts.append((piece, span_meta[key]))
+        previous_end = match.end()
+
+    if len(parts) != len(span_meta):
+        missing = [k for k in span_meta if k not in {f"s{i}" for i in range(len(parts))}]
+        raise ValueError(f"DeepL did not preserve all mapping markers: {missing}")
+    return parts
+
+
+def _style_html_for_span(text: str, span: dict[str, Any]) -> str:
+    """Convert a translated span to HTML while using one shared text box."""
+    text = re.sub(r"</?bold(?:\s+[^>]*)?>", "", text)
+    text = re.sub(r"</?italic(?:\s+[^>]*)?>", "", text)
+    text = re.sub(r"</?underline(?:\s+[^>]*)?>", "", text)
+    text = _strip_mapping_markers(text)
+    text = text.replace("\n", "<br>")
+
+    _, _, underline = _span_style_flags(span)
+    flags = int(span.get("flags", 0) or 0)
+    font = str(span.get("font", "")).lower()
+    bold = bool(flags & 16) or "bold" in font
+    italic = bool(flags & 2) or "italic" in font or "oblique" in font
+    color_value = int(span.get("color", 0) or 0)
+    try:
+        rgb = fitz.sRGB_to_rgb(color_value)
+        color = "#%02x%02x%02x" % rgb
+    except Exception:
+        color = "#000000"
+
+    size = float(span.get("size", 12) or 12)
+    styles = [f"font-size:{size:g}pt", f"color:{color}"]
+    if bold:
+        styles.append("font-weight:bold")
+    if italic:
+        styles.append("font-style:italic")
+    if underline:
+        styles.append("text-decoration:underline")
+    return f'<span style="{";".join(styles)}">{html.escape(text, quote=False).replace("&lt;br&gt;", "<br>")}</span>'
+
+
+def _build_group_html(translated: str, span_meta: dict[str, dict[str, Any]]) -> str:
+    """Build one HTML flow for the entire translated group.
+
+    The original span rectangles are deliberately NOT used for placement.
+    They are used only as style metadata. PyMuPDF lays out the complete group
+    inside one shared rectangle, so translated text can naturally reflow.
+    """
+    parts = _parse_tagged_html_parts(translated, span_meta)
+    html_parts: list[str] = []
+    for piece, span in parts:
+        html_parts.append(_style_html_for_span(piece, span))
+    return "".join(html_parts)
 
 
 def translate_text_blocks(text: str, source_lang: str = "auto", target_lang: str = "ko", tagged: bool = False) -> tuple[str, bool]:
@@ -252,56 +323,32 @@ def _align(group: dict[str, Any], page_rect: fitz.Rect) -> int:
     return fitz.TEXT_ALIGN_LEFT
 
 
-def _draw_underline(page: fitz.Page, span: dict[str, Any], color: tuple[float, float, float]) -> None:
-    rect = fitz.Rect(span["bbox"])
-    size = max(4.0, float(span.get("size", 12) or 12))
-    y = rect.y1 - max(0.8, size * 0.08)
-    try:
-        page.draw_line(
-            fitz.Point(rect.x0, y),
-            fitz.Point(rect.x1, y),
-            color=color,
-            width=max(0.5, size * 0.055),
-            overlay=True,
-        )
-    except Exception as exc:
-        print(f"밑줄 삽입 실패: {exc}")
-
-
-def _insert_span(page: fitz.Page, span: dict[str, Any], text: str) -> bool:
-    if not text:
-        return True
-    rect = fitz.Rect(span["bbox"])
-    size = max(4.0, float(span.get("size", 12) or 12))
-    font_name, color, _, _, underline = _span_style(span)
-    while size >= 4:
-        result = page.insert_textbox(
-            rect,
-            text,
-            fontsize=size,
-            fontname=font_name,
-            fontfile=str(FONT_BOLD_PATH if font_name == FONT_BOLD_NAME else FONT_PATH),
-            color=color,
-            align=fitz.TEXT_ALIGN_LEFT,
-            overlay=True,
-        )
-        if result >= 0:
-            if underline:
-                _draw_underline(page, span, color)
-            return True
-        size -= .5
-    return False
-
-
 def _insert_group(page: fitz.Page, group: dict[str, Any], translated: str, tagged_translation: bool = False) -> bool:
     if tagged_translation:
         try:
             _, span_meta = _build_tagged_text(group)
-            translated_by_span = _parse_tagged_translation(translated, span_meta)
-            inserted_any = False
-            for key, span in span_meta.items():
-                inserted_any = _insert_span(page, span, translated_by_span[key]) or inserted_any
-            return inserted_any
+            html_text = _build_group_html(translated, span_meta)
+            rect = fitz.Rect(group["bbox"])
+            style = _style(group)
+            size = max(4.0, style["size"])
+            archive = fitz.Archive(str(FONT_DIR))
+            css = f"""
+            @font-face {{ font-family: {FONT_NAME}; src: url(NotoSansKR-Regular.ttf); }}
+            @font-face {{ font-family: {FONT_NAME}; src: url(NotoSansKR-Bold.ttf); font-weight: bold; }}
+            * {{ font-family: {FONT_NAME}; font-size: {size:g}pt; margin: 0; padding: 0; }}
+            """
+            # One and only one PDF text insertion for the whole group.
+            result = page.insert_htmlbox(
+                rect,
+                html_text,
+                css=css,
+                archive=archive,
+                scale_low=0.55,
+                overlay=True,
+            )
+            if result[0] >= 0:
+                return True
+            raise ValueError(f"HTML group did not fit: {result}")
         except Exception as exc:
             print(f"서식 매핑 실패, 마커 제거 후 그룹 단위 삽입으로 전환: {exc}")
             clean_text = _clean_piece(translated)
