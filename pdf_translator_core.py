@@ -94,7 +94,7 @@ def _distance_to_rect(text_rect: fitz.Rect, image_rect: fitz.Rect) -> float:
 def _nearest_image_distance(rect: fitz.Rect, image_rects: list[fitz.Rect]) -> tuple[float, fitz.Rect | None]:
     if not image_rects:
         return float("inf"), None
-    distances = [( _distance_to_rect(rect, image_rect), image_rect) for image_rect in image_rects]
+    distances = [(_distance_to_rect(rect, image_rect), image_rect) for image_rect in image_rects]
     return min(distances, key=lambda item: item[0])
 
 
@@ -112,42 +112,8 @@ def _is_near_image(rect: fitz.Rect, image_rects: list[fitz.Rect]) -> tuple[bool,
     return distance <= threshold, distance, image_rect
 
 
-def _get_underline_rects(page: fitz.Page) -> list[fitz.Rect]:
-    """Find thin horizontal vector lines that are likely text underlines."""
-    result: list[fitz.Rect] = []
-    try:
-        drawings = page.get_drawings()
-    except Exception:
-        return result
-
-    for drawing in drawings:
-        rect = fitz.Rect(drawing.get("rect", (0, 0, 0, 0)))
-        if (
-            rect.width >= 4
-            and rect.height <= 2.5
-            and rect.width <= page.rect.width * 0.9
-        ):
-            result.append(rect)
-    return result
-
-
-def _underlines_for_replacement(
-    rect: fitz.Rect, underline_rects: list[fitz.Rect]
-) -> list[fitz.Rect]:
-    """Return underline-like drawings belonging to a translated text box."""
-    result = []
-    for line in underline_rects:
-        horizontal_overlap = max(0.0, min(rect.x1, line.x1) - max(rect.x0, line.x0))
-        if horizontal_overlap < min(line.width * 0.5, rect.width * 0.4):
-            continue
-        if line.y0 < rect.y0 - 2 or line.y0 > rect.y1 + max(4.0, rect.height * 0.35):
-            continue
-        result.append(line)
-    return result
-
-
 def _insert_translation(page: fitz.Page, rect: fitz.Rect, text: str, original_font_size: float) -> bool:
-    """Insert translated text, shrinking only when the original box is too small."""
+    """Insert translated text without modifying the source page."""
     fontsize = max(4.0, original_font_size)
     while fontsize >= 4:
         result = page.insert_textbox(
@@ -165,6 +131,39 @@ def _insert_translation(page: fitz.Page, rect: fitz.Rect, text: str, original_fo
     return False
 
 
+def _render_translation_background(
+    source_page: fitz.Page,
+    replacements: list[tuple[fitz.Rect, str, float]],
+    dpi: int = 150,
+) -> tuple[bytes, float]:
+    """Render the original page to an image and mask only text that will be translated.
+
+    The source PDF page is never redacted or modified. The returned image becomes the
+    visual background of a newly-created output page, after which translations are
+    inserted as real PDF text.
+    """
+    scale = dpi / 72.0
+    matrix = fitz.Matrix(scale, scale)
+    pix = source_page.get_pixmap(matrix=matrix, alpha=False)
+
+    # Work on a temporary document so the raster background can be edited without
+    # touching the original page or its PDF objects.
+    image_doc = fitz.open()
+    try:
+        image_page = image_doc.new_page(width=source_page.rect.width, height=source_page.rect.height)
+        image_page.insert_image(source_page.rect, pixmap=pix)
+
+        # Mask only groups that actually have a different translation. Text inside
+        # images is never included because image-overlapping groups are skipped.
+        for rect, _, _ in replacements:
+            image_page.draw_rect(rect, color=None, fill=(1, 1, 1), overlay=True)
+
+        rendered = image_page.get_pixmap(matrix=matrix, alpha=False)
+        return rendered.tobytes("png"), scale
+    finally:
+        image_doc.close()
+
+
 def translate_pdf_file(
     input_pdf_path: str,
     output_pdf_path: str,
@@ -172,23 +171,30 @@ def translate_pdf_file(
     target_lang: str = "ko",
     debug_grouping: bool = False,
 ) -> int:
-    """Translate PDF using deterministic layout grouping, including safe image-adjacent text."""
+    """Translate each source page onto a newly-created page.
+
+    Unlike the old implementation, the original page is never redacted, recolored,
+    or otherwise modified. For every source page we create a fresh page, use a
+    rasterized copy of the source as its visual background, mask only the text groups
+    being replaced, and insert the Korean translations as a new text layer.
+    """
     if not FONT_PATH.exists():
         raise FileNotFoundError(
             f"Noto Sans KR font not found: {FONT_PATH}\n"
             "Put NotoSansKR-Regular.ttf in the fonts folder."
         )
 
-    doc = fitz.open(input_pdf_path)
+    source_doc = fitz.open(input_pdf_path)
+    output_doc = fitz.open()
     translated_count = 0
     skipped_image_count = 0
     translated_near_image_count = 0
+
     try:
-        for page_number, page in enumerate(doc, start=1):
-            lines = _get_span_info(page)
-            groups = group_page(page, lines, debug=debug_grouping)
-            image_rects = _get_image_rects(page)
-            underline_rects = _get_underline_rects(page)
+        for page_number, source_page in enumerate(source_doc, start=1):
+            lines = _get_span_info(source_page)
+            groups = group_page(source_page, lines, debug=debug_grouping)
+            image_rects = _get_image_rects(source_page)
             replacements: list[tuple[fitz.Rect, str, float]] = []
 
             print(f"페이지 {page_number}: {len(lines)} lines -> {len(groups)} logical groups")
@@ -201,7 +207,10 @@ def translate_pdf_file(
                 rect = fitz.Rect(item["bbox"])
                 if _overlaps_image(rect, image_rects):
                     skipped_image_count += 1
-                    print(f"이미지 겹침으로 건너뜀 (페이지 {page_number}, group {group_index}): {text[:80]}")
+                    print(
+                        f"이미지 겹침으로 건너뜀 (페이지 {page_number}, group {group_index}): "
+                        f"{text[:80]}"
+                    )
                     continue
 
                 near_image, image_distance, nearest_image = _is_near_image(rect, image_rects)
@@ -226,26 +235,35 @@ def translate_pdf_file(
                 if near_image and nearest_image is not None:
                     print("nearest image bbox:", nearest_image)
 
-            for rect, _, _ in replacements:
-                page.add_redact_annot(rect, fill=False, cross_out=False)
-                for underline in _underlines_for_replacement(rect, underline_rects):
-                    page.add_redact_annot(underline, fill=False, cross_out=False)
+            # Every output page is created independently. The source page remains
+            # untouched in source_doc for the entire operation.
+            output_page = output_doc.new_page(
+                width=source_page.rect.width,
+                height=source_page.rect.height,
+            )
 
             if replacements:
-                page.apply_redactions(images=0, graphics=2, text=0)
+                background_png, _ = _render_translation_background(source_page, replacements)
+                output_page.insert_image(output_page.rect, stream=background_png)
+            else:
+                # Pages without translations are copied visually as-is.
+                pix = source_page.get_pixmap(matrix=fitz.Matrix(150 / 72.0, 150 / 72.0), alpha=False)
+                output_page.insert_image(output_page.rect, pixmap=pix)
 
             for rect, translated, original_font_size in replacements:
-                inserted = _insert_translation(page, rect, translated, original_font_size)
+                inserted = _insert_translation(output_page, rect, translated, original_font_size)
                 print("삽입 결과:", inserted)
                 if inserted:
                     translated_count += 1
 
-        doc.save(output_pdf_path, garbage=2, deflate=True)
+        output_doc.save(output_pdf_path, garbage=2, deflate=True)
     finally:
-        doc.close()
+        output_doc.close()
+        source_doc.close()
 
     print("이미지와 겹쳐 건너뛴 텍스트:", skipped_image_count)
     print("이미지와 가깝지만 바깥에 있어 번역한 텍스트:", translated_near_image_count)
+    print("원본 페이지는 수정하지 않고 새 페이지에 번역 결과를 생성했습니다.")
     return translated_count
 
 
