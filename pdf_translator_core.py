@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 import time
 from pathlib import Path
 from typing import Iterable
@@ -11,11 +10,12 @@ from deep_translator import GoogleTranslator
 FONT_PATH = Path(__file__).resolve().parent / "fonts" / "NotoSansKR-Regular.ttf"
 FONT_NAME = "NotoSansKR"
 
-# Translation requests can occasionally receive Google's HTML error page instead
-# of a translated string. Keep retries conservative so a temporary failure does
-# not abort the whole PDF translation.
+# Keep the number of requests low and give Google time to recover from transient
+# server/rate-limit responses.
+TRANSLATION_BATCH_SIZE = 10
 TRANSLATION_RETRIES = 3
-TRANSLATION_RETRY_DELAY = 2.0
+TRANSLATION_RETRY_DELAYS = (10.0, 30.0, 60.0)
+BATCH_DELAY = 1.0
 GOOGLE_ERROR_MARKERS = (
     "Error 500",
     "Server Error",
@@ -27,11 +27,53 @@ GOOGLE_ERROR_MARKERS = (
 
 
 def _looks_like_google_error(text: str) -> bool:
-    """Return True when a response looks like Google's error page rather than a translation."""
     if not text:
         return True
-    normalized = text.strip().lower()
+    normalized = str(text).strip().lower()
     return any(marker.lower() in normalized for marker in GOOGLE_ERROR_MARKERS)
+
+
+def _translate_batch_once(
+    texts: list[str],
+    source_lang: str,
+    target_lang: str,
+) -> list[str]:
+    """Translate a batch while preserving one result per input item."""
+    translator = GoogleTranslator(source=source_lang, target=target_lang)
+    results = translator.translate_batch(texts)
+    if not isinstance(results, list) or len(results) != len(texts):
+        raise RuntimeError(
+            f"Google Translate returned an unexpected batch response: "
+            f"expected {len(texts)}, got {len(results) if isinstance(results, list) else type(results).__name__}"
+        )
+
+    cleaned: list[str] = []
+    for original, translated in zip(texts, results):
+        if not translated or _looks_like_google_error(str(translated)):
+            raise RuntimeError("Google Translate returned an empty response or an error-page response")
+        cleaned.append(str(translated))
+    return cleaned
+
+
+def _translate_batch_with_retry(
+    texts: list[str],
+    source_lang: str,
+    target_lang: str,
+) -> list[str] | None:
+    """Retry a whole batch with exponential backoff; return None after final failure."""
+    for attempt in range(1, TRANSLATION_RETRIES + 1):
+        try:
+            return _translate_batch_once(texts, source_lang, target_lang)
+        except Exception as exc:
+            print(
+                f"번역 batch 실패 (시도 {attempt}/{TRANSLATION_RETRIES}, "
+                f"{len(texts)}개): {exc}"
+            )
+            if attempt < TRANSLATION_RETRIES:
+                delay = TRANSLATION_RETRY_DELAYS[attempt - 1]
+                print(f"{delay:.0f}초 후 batch 재시도합니다.")
+                time.sleep(delay)
+    return None
 
 
 def translate_text_blocks(
@@ -39,43 +81,48 @@ def translate_text_blocks(
     source_lang: str = "auto",
     target_lang: str = "ko",
 ) -> str:
-    """Translate text with retries and protection against Google's error-page response."""
+    """Backward-compatible single-text translation helper."""
     if not text or not text.strip():
         return text
+    result = _translate_batch_with_retry([text], source_lang, target_lang)
+    return result[0] if result else text
 
-    last_error: Exception | None = None
-    for attempt in range(1, TRANSLATION_RETRIES + 1):
-        try:
-            translated = GoogleTranslator(
-                source=source_lang,
-                target=target_lang,
-            ).translate(text)
 
-            if translated and not _looks_like_google_error(translated):
-                return translated
+def _translate_lines(
+    lines: list[dict],
+    source_lang: str,
+    target_lang: str,
+) -> list[str]:
+    """Translate independent PDF lines in batches without grouping their layout."""
+    translations = [item["text"] for item in lines]
 
-            last_error = RuntimeError(
-                "Google Translate returned an empty response or an error-page response"
-            )
-            print(
-                f"번역 응답 이상 (시도 {attempt}/{TRANSLATION_RETRIES}): "
-                f"{str(translated)[:120]!r}"
-            )
-        except Exception as exc:
-            last_error = exc
-            print(
-                f"번역 요청 실패 (시도 {attempt}/{TRANSLATION_RETRIES}): {exc}"
-            )
+    for start in range(0, len(lines), TRANSLATION_BATCH_SIZE):
+        end = min(start + TRANSLATION_BATCH_SIZE, len(lines))
+        batch = [lines[i]["text"] for i in range(start, end)]
+        result = _translate_batch_with_retry(batch, source_lang, target_lang)
 
-        if attempt < TRANSLATION_RETRIES:
-            time.sleep(TRANSLATION_RETRY_DELAY * attempt)
+        if result is None:
+            # If a whole batch fails, split it recursively. This isolates a bad
+            # request and prevents one transient failure from losing the page.
+            if len(batch) > 1:
+                midpoint = len(batch) // 2
+                left = _translate_batch_with_retry(batch[:midpoint], source_lang, target_lang)
+                right = _translate_batch_with_retry(batch[midpoint:], source_lang, target_lang)
+                if left is not None:
+                    translations[start:start + midpoint] = left
+                if right is not None:
+                    translations[start + midpoint:end] = right
+            continue
 
-    print(f"번역 최종 실패, 원문 유지: {last_error}")
-    return text
+        translations[start:end] = result
+        if end < len(lines):
+            time.sleep(BATCH_DELAY)
+
+    return translations
 
 
 def _get_span_info(page: fitz.Page) -> list[dict]:
-    """Extract PDF lines while retaining original span and layout metadata."""
+    """Extract PDF lines while retaining original line coordinates and font metadata."""
     result = []
     data = page.get_text("dict")
     for block_index, block in enumerate(data.get("blocks", [])):
@@ -120,7 +167,7 @@ def _copy_images_to_page(
     output_page: fitz.Page,
     image_occurrences: list[dict],
 ) -> int:
-    """Copy source images onto the blank output page at their original positions."""
+    """Copy source images onto the blank translated page at original positions."""
     copied = 0
     for occurrence in image_occurrences:
         rect = occurrence["bbox"]
@@ -130,9 +177,6 @@ def _copy_images_to_page(
             image_bytes = image.get("image")
             if not image_bytes:
                 continue
-
-            # Images are placed first. Text is inserted afterwards, so text that
-            # originally sat over an image remains visible on top of that image.
             output_page.insert_image(rect, stream=image_bytes, overlay=False)
             copied += 1
         except Exception as exc:
@@ -146,7 +190,7 @@ def _insert_translation(
     text: str,
     original_font_size: float,
 ) -> bool:
-    """Insert translated text onto the new page, with a transparent background."""
+    """Insert translated text with a transparent background."""
     fontsize = max(4.0, original_font_size)
     while fontsize >= 4:
         result = page.insert_textbox(
@@ -172,14 +216,13 @@ def translate_pdf_file(
     target_lang: str = "ko",
     debug_grouping: bool = False,
 ) -> int:
-    """Create blank output pages, copy only images, then place translated text.
+    """Write [translated page, original page] for every source page.
 
-    The source PDF is used only for extracting text coordinates and image objects.
-    No source page is rendered, redacted, or copied as a whole. Each output page is
-    blank, source images are placed first, and translated text is placed transparently
-    on top. Image-overlap and image-nearby text is therefore never skipped.
+    The translated page starts completely blank. Images are copied first and
+    translated text is then placed transparently on top. The original source
+    page is retained immediately after it for reference.
     """
-    del debug_grouping  # grouping is intentionally no longer used on this branch
+    del debug_grouping  # grouping is intentionally not used on this branch
 
     if not FONT_PATH.exists():
         raise FileNotFoundError(
@@ -197,39 +240,39 @@ def translate_pdf_file(
             lines = _get_span_info(source_page)
             image_occurrences = _get_image_occurrences(source_page)
 
-            output_page = output_doc.new_page(
+            # Page A: genuinely blank page containing copied images + translations.
+            translated_page = output_doc.new_page(
                 width=source_page.rect.width,
                 height=source_page.rect.height,
             )
-
-            # 1. Start from a genuinely blank page.
-            # 2. Copy only the original images.
-            # 3. Add translated text afterwards, so text can safely overlap images.
             copied_images = _copy_images_to_page(
                 source_doc,
-                output_page,
+                translated_page,
                 image_occurrences,
             )
             image_count += copied_images
+
+            translations = _translate_lines(lines, source_lang, target_lang)
 
             print(
                 f"페이지 {page_number}: {len(lines)} lines, "
                 f"{copied_images}/{len(image_occurrences)} images"
             )
 
-            for line_index, item in enumerate(lines):
+            for line_index, (item, translated) in enumerate(zip(lines, translations)):
                 text = item["text"].strip()
                 if not text or len(text) < 2:
                     continue
 
-                rect = fitz.Rect(item["bbox"])
-                translated = translate_text_blocks(text, source_lang, target_lang)
+                # If translation failed, retain no text on the translated page;
+                # the original page immediately following it remains available.
                 if translated == text:
                     continue
 
+                rect = fitz.Rect(item["bbox"])
                 original_font_size = max(4.0, float(item.get("size", 12.0)))
                 inserted = _insert_translation(
-                    output_page,
+                    translated_page,
                     rect,
                     translated,
                     original_font_size,
@@ -244,6 +287,16 @@ def translate_pdf_file(
                 if inserted:
                     translated_count += 1
 
+            # Page B: retain the complete original page for direct comparison.
+            # show_pdf_page copies the original page without rasterizing it.
+            original_page = output_doc.new_page(
+                width=source_page.rect.width,
+                height=source_page.rect.height,
+            )
+            original_page.show_pdf_page(original_page.rect, source_doc, page_number - 1)
+
+            print(f"페이지 {page_number}: 번역 페이지 + 원본 페이지 추가 완료")
+
         output_doc.save(output_pdf_path, garbage=2, deflate=True)
     finally:
         output_doc.close()
@@ -251,7 +304,7 @@ def translate_pdf_file(
 
     print("복사한 이미지:", image_count)
     print("번역하여 삽입한 텍스트:", translated_count)
-    print("이미지 위/근처 텍스트도 스킵하지 않고 번역했습니다.")
+    print("페이지 순서: [번역 페이지, 원본 페이지] × 전체 페이지")
     return translated_count
 
 
