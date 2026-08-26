@@ -3,7 +3,6 @@ from __future__ import annotations
 import html
 import os
 import re
-import time
 import uuid
 from pathlib import Path
 from typing import Any, Iterable
@@ -17,9 +16,6 @@ FONT_PATH = FONT_DIR / "NotoSansKR-Regular.ttf"
 FONT_BOLD_PATH = FONT_DIR / "NotoSansKR-Bold.ttf"
 FONT_NAME = "NotoSansKR"
 FONT_BOLD_NAME = "NotoSansKRBold"
-RETRIES = 3
-TRANSLATION_DELAY = 1
-RETRY_BACKOFF = 3
 
 
 def _deepl_target_language(target_lang: str) -> str:
@@ -148,8 +144,6 @@ def _parse_tagged_html_parts(value: str, span_meta: dict[str, dict[str, Any]]) -
             continue
         piece = value[previous_end:match.start()]
         piece = _normalize_boundary_whitespace(piece)
-        # The tags have already been validated by DeepL's XML handling. Escape
-        # text again only after converting our private tags to HTML below.
         parts.append((piece, span_meta[key]))
         previous_end = match.end()
 
@@ -160,7 +154,6 @@ def _parse_tagged_html_parts(value: str, span_meta: dict[str, dict[str, Any]]) -
 
 
 def _style_html_for_span(text: str, span: dict[str, Any]) -> str:
-    """Convert a translated span to HTML while using one shared text box."""
     text = re.sub(r"</?bold(?:\s+[^>]*)?>", "", text)
     text = re.sub(r"</?italic(?:\s+[^>]*)?>", "", text)
     text = re.sub(r"</?underline(?:\s+[^>]*)?>", "", text)
@@ -191,12 +184,6 @@ def _style_html_for_span(text: str, span: dict[str, Any]) -> str:
 
 
 def _build_group_html(translated: str, span_meta: dict[str, dict[str, Any]]) -> str:
-    """Build one HTML flow for the entire translated group.
-
-    The original span rectangles are deliberately NOT used for placement.
-    They are used only as style metadata. PyMuPDF lays out the complete group
-    inside one shared rectangle, so translated text can naturally reflow.
-    """
     parts = _parse_tagged_html_parts(translated, span_meta)
     html_parts: list[str] = []
     for piece, span in parts:
@@ -219,17 +206,14 @@ def translate_text_blocks(text: str, source_lang: str = "auto", target_lang: str
     if tagged:
         kwargs["tag_handling"] = "xml"
         kwargs["outline_detection"] = False
-    for attempt in range(RETRIES):
-        try:
-            result = translator.translate_text(text, **kwargs)
-            translated = str(result.text).strip()
-            if translated:
-                return translated, True
-            raise RuntimeError("DeepL returned an empty response")
-        except Exception as exc:
-            print(f"번역 group 실패 (시도 {attempt + 1}/{RETRIES}): {exc}")
-            if attempt < RETRIES - 1:
-                time.sleep(RETRY_BACKOFF * (attempt + 1))
+    try:
+        result = translator.translate_text(text, **kwargs)
+        translated = str(result.text).strip()
+        if translated:
+            return translated, True
+        print("DeepL returned an empty response")
+    except Exception as exc:
+        print(f"번역 group 실패: {exc}")
     return text, False
 
 
@@ -253,15 +237,7 @@ def _get_span_info(page: fitz.Page) -> list[dict[str, Any]]:
             if not text:
                 continue
             dominant = max(spans, key=lambda s: float(s.get("size", 12) or 12))
-            result.append({
-                "text": text,
-                "bbox": fitz.Rect(line["bbox"]),
-                "size": float(dominant.get("size", 12) or 12),
-                "spans": spans,
-                "block_index": bi,
-                "line_index": li,
-                "dir": tuple(line.get("dir", (1.0, 0.0))),
-            })
+            result.append({"text": text, "bbox": fitz.Rect(line["bbox"]), "size": float(dominant.get("size", 12) or 12), "spans": spans, "block_index": bi, "line_index": li, "dir": tuple(line.get("dir", (1.0, 0.0)))})
     return result
 
 
@@ -337,15 +313,7 @@ def _insert_group(page: fitz.Page, group: dict[str, Any], translated: str, tagge
             @font-face {{ font-family: {FONT_NAME}; src: url(NotoSansKR-Bold.ttf); font-weight: bold; }}
             * {{ font-family: {FONT_NAME}; font-size: {size:g}pt; margin: 0; padding: 0; }}
             """
-            # One and only one PDF text insertion for the whole group.
-            result = page.insert_htmlbox(
-                rect,
-                html_text,
-                css=css,
-                archive=archive,
-                scale_low=0.55,
-                overlay=True,
-            )
+            result = page.insert_htmlbox(rect, html_text, css=css, archive=archive, scale_low=0.55, overlay=True)
             if result[0] >= 0:
                 return True
             raise ValueError(f"HTML group did not fit: {result}")
@@ -354,21 +322,11 @@ def _insert_group(page: fitz.Page, group: dict[str, Any], translated: str, tagge
             clean_text = _clean_piece(translated)
     else:
         clean_text = _clean_piece(translated)
-
     style = _style(group)
     rect = fitz.Rect(group["bbox"])
     size = max(4.0, style["size"])
     while size >= 4:
-        result = page.insert_textbox(
-            rect,
-            clean_text,
-            fontsize=size,
-            fontname=FONT_NAME,
-            fontfile=str(FONT_PATH),
-            color=(0, 0, 0),
-            align=_align(group, page.rect),
-            overlay=True,
-        )
+        result = page.insert_textbox(rect, clean_text, fontsize=size, fontname=FONT_NAME, fontfile=str(FONT_PATH), color=(0, 0, 0), align=_align(group, page.rect), overlay=True)
         if result >= 0:
             return True
         size -= .5
@@ -389,16 +347,12 @@ def translate_pdf_file(input_pdf_path: str, output_pdf_path: str, source_lang: s
             translated_page = output_doc.new_page(width=source_page.rect.width, height=source_page.rect.height)
             image_count += _copy_images(source_doc, translated_page, _images(source_page))
             print(f"페이지 {page_number}: {len(lines)} lines -> {len(groups)} groups")
-            request_made = False
             for group_index, group in enumerate(groups):
                 text = str(group.get("text", "")).strip()
                 if len(text) < 2:
                     continue
-                if request_made:
-                    time.sleep(TRANSLATION_DELAY)
                 tagged_text, _ = _build_tagged_text(group)
                 translated, success = translate_text_blocks(tagged_text, source_lang, target_lang, tagged=True)
-                request_made = True
                 if success:
                     inserted = _insert_group(translated_page, group, translated, tagged_translation=True)
                     display_translation = _clean_piece(translated)[:200]
