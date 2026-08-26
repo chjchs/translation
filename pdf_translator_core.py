@@ -44,12 +44,6 @@ def _span_style_flags(span: dict[str, Any]) -> tuple[bool, bool]:
 
 
 def _build_tagged_text(group: dict[str, Any]) -> tuple[str, dict[str, dict[str, Any]]]:
-    """Build one complete group for DeepL.
-
-    DeepL receives the complete sentence/group in one request. Formatting is
-    expressed inline with <bold>/<italic>. A unique marker is appended only as
-    an invisible mapping sentinel; it is never used to split translation calls.
-    """
     span_meta: dict[str, dict[str, Any]] = {}
     chunks: list[str] = []
     token = uuid.uuid4().hex[:10]
@@ -67,10 +61,8 @@ def _build_tagged_text(group: dict[str, Any]) -> tuple[str, dict[str, dict[str, 
             bold, italic = _span_style_flags(span)
             opening = ("<bold>" if bold else "") + ("<italic>" if italic else "")
             closing = ("</italic>" if italic else "") + ("</bold>" if bold else "")
-            # Put the sentinel AFTER the text rather than before it. DeepL is
-            # much less likely to treat it as a leading word/spacing boundary.
             marker = f"[[MAP_{token}_{span_index}]]"
-            chunks.append(opening + _escape_xml_text(raw) + marker + closing)
+            chunks.append(opening + _escape_xml_text(raw) + closing + marker)
             span_index += 1
 
     return "".join(chunks), span_meta
@@ -84,18 +76,35 @@ def _strip_mapping_markers(text: str) -> str:
     return re.sub(r"\[\[MAP_[A-Za-z0-9]+_\d+\]\]", "", text)
 
 
-def _parse_tagged_translation(value: str, span_meta: dict[str, dict[str, Any]]) -> dict[str, str]:
-    """Map the single translated group back to its original spans.
+def _normalize_boundary_whitespace(text: str) -> str:
+    """Remove only whitespace directly adjacent to formatting tags.
 
-    Handles markers that DeepL preserves, including repeated numbering from
-    separately translated groups, because each request gets a unique token.
+    The space belonging to the sentence is preserved. The purpose is to avoid
+    carrying XML-boundary padding into the PDF when DeepL returns spaces inside
+    <bold>/<italic> boundaries.
     """
+    text = re.sub(r"\s+(?=<\s*/?(?:bold|italic)\b)", "", text)
+    text = re.sub(r"(?<=</(?:bold|italic)>)\s+", " ", text)
+    text = re.sub(r"(<(?:bold|italic)>)[ \t\u00a0]+", r"\1", text)
+    text = re.sub(r"[ \t\u00a0]+(</(?:bold|italic)>)", r"\1", text)
+    return text
+
+
+def _clean_piece(text: str) -> str:
+    text = _normalize_boundary_whitespace(text)
+    text = _strip_format_tags(text)
+    text = _strip_mapping_markers(text)
+    return text
+
+
+def _parse_tagged_translation(value: str, span_meta: dict[str, dict[str, Any]]) -> dict[str, str]:
     matches = list(re.finditer(r"\[\[MAP_([A-Za-z0-9]+)_(\d+)\]\]", value))
     if not matches:
         raise ValueError("DeepL removed all mapping markers")
 
     result: dict[str, str] = {}
     expected_token = matches[0].group(1)
+    previous_end = 0
     for match in matches:
         if match.group(1) != expected_token:
             continue
@@ -103,14 +112,12 @@ def _parse_tagged_translation(value: str, span_meta: dict[str, dict[str, Any]]) 
         key = f"s{index}"
         if key not in span_meta:
             continue
-        start = matches[matches.index(match) - 1].end() if matches.index(match) > 0 else 0
-        # Only use the text since the previous marker. This preserves normal
-        # spaces exactly as DeepL returned them instead of inventing spaces.
-        piece = value[start:match.start()]
-        piece = _strip_format_tags(piece)
+        piece = value[previous_end:match.start()]
+        piece = _clean_piece(piece)
         if index == 0:
             piece = piece.lstrip("\n")
         result[key] = piece
+        previous_end = match.end()
 
     if len(result) != len(span_meta):
         missing = [k for k in span_meta if k not in result]
@@ -242,9 +249,9 @@ def _insert_group(page: fitz.Page, group: dict[str, Any], translated: str, tagge
             return inserted_any
         except Exception as exc:
             print(f"서식 매핑 실패, 마커 제거 후 그룹 단위 삽입으로 전환: {exc}")
-            clean_text = _strip_mapping_markers(_strip_format_tags(translated))
+            clean_text = _clean_piece(translated)
     else:
-        clean_text = _strip_mapping_markers(_strip_format_tags(translated))
+        clean_text = _clean_piece(translated)
 
     style = _style(group)
     rect = fitz.Rect(group["bbox"])
@@ -283,11 +290,10 @@ def translate_pdf_file(input_pdf_path: str, output_pdf_path: str, source_lang: s
                 request_made = True
                 if success:
                     inserted = _insert_group(translated_page, group, translated, tagged_translation=True)
-                    display_translation = _strip_mapping_markers(_strip_format_tags(translated))[:200]
+                    display_translation = _clean_piece(translated)[:200]
                 else:
                     print("번역 실패, 원문 그대로 삽입:", text[:200])
-                    # Never insert mapping markers into the PDF on a failed request.
-                    clean_original = _strip_mapping_markers(_strip_format_tags(tagged_text))
+                    clean_original = _clean_piece(tagged_text)
                     inserted = _insert_group(translated_page, group, clean_original, tagged_translation=False)
                     display_translation = text[:200]
                 print(f"그룹 {group_index} ({group.get('group_type')}): {len(group.get('lines', []))} lines")
