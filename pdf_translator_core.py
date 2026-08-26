@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any, Iterable
-from xml.etree import ElementTree as ET
 
 import deepl
 import fitz
@@ -45,10 +45,10 @@ def _span_style_flags(span: dict[str, Any]) -> tuple[bool, bool]:
 
 
 def _build_tagged_text(group: dict[str, Any]) -> tuple[str, dict[str, dict[str, Any]]]:
-    """Build one complete group as a single XML-aware DeepL request.
+    """Build the complete group as one DeepL request with inline style tags.
 
-    Formatting tags are inline in the sentence; no styled span is sent as a
-    separate translation request.
+    [[SPAN_n]] markers are plain-text sentinels used only to map the translated
+    pieces back to their original PDF spans. They are never used as XML tags.
     """
     span_meta: dict[str, dict[str, Any]] = {}
     chunks: list[str] = []
@@ -62,27 +62,33 @@ def _build_tagged_text(group: dict[str, Any]) -> tuple[str, dict[str, dict[str, 
             if not raw:
                 continue
             key = f"s{span_index}"
-            span_index += 1
             span_meta[key] = span
             bold, italic = _span_style_flags(span)
-            opening = []
-            closing = []
+            opening: list[str] = []
+            closing: list[str] = []
             if bold:
                 opening.append("<bold>")
                 closing.insert(0, "</bold>")
             if italic:
                 opening.append("<italic>")
                 closing.insert(0, "</italic>")
-            # The span itself is NOT an XML element sent to DeepL. It is only
-            # represented by an internal marker so formatting can be mapped back.
-            marker = f"[[SPAN_{span_index - 1}]]"
+            marker = f"[[SPAN_{span_index}]]"
             chunks.append("".join(opening) + marker + _escape_xml_text(raw) + "".join(closing))
+            span_index += 1
 
     return "".join(chunks), span_meta
 
 
+def _strip_format_tags(text: str) -> str:
+    return re.sub(r"</?(?:bold|italic)(?:\s+[^>]*)?>", "", text)
+
+
+def _strip_span_markers(text: str) -> str:
+    return re.sub(r"\[\[SPAN_\d+\]\]", "", text)
+
+
 def _parse_tagged_translation(value: str, span_meta: dict[str, dict[str, Any]]) -> dict[str, str]:
-    """Recover translated text around internal span markers."""
+    """Split one translated group by the preserved [[SPAN_n]] markers."""
     result: dict[str, str] = {}
     for index, key in enumerate(span_meta):
         marker = f"[[SPAN_{index}]]"
@@ -90,13 +96,12 @@ def _parse_tagged_translation(value: str, span_meta: dict[str, dict[str, Any]]) 
         if start < 0:
             continue
         start += len(marker)
-        next_positions = [value.find(f"[[SPAN_{j}]]", start) for j in range(index + 1, len(span_meta))]
-        next_positions = [p for p in next_positions if p >= 0]
-        end = min(next_positions) if next_positions else len(value)
-        text = value[start:end]
-        # Remove any formatting XML tags while retaining translated text.
-        text = re.sub(r"</?(?:bold|italic|color_[^>]+)>", "", text)
-        result[key] = text.strip()
+        next_marker = value.find(f"[[SPAN_{index + 1}]]", start)
+        end = next_marker if next_marker >= 0 else len(value)
+        piece = value[start:end]
+        piece = _strip_format_tags(piece)
+        # A marker should identify a span, not contribute whitespace to it.
+        result[key] = piece
     return result
 
 
@@ -107,7 +112,11 @@ def translate_text_blocks(text: str, source_lang: str = "auto", target_lang: str
     if not api_key:
         raise RuntimeError("DEEPL_API_KEY environment variable is not set")
     translator = deepl.DeepLClient(api_key)
-    kwargs: dict[str, Any] = {"source_lang": _deepl_source_language(source_lang), "target_lang": _deepl_target_language(target_lang), "preserve_formatting": True}
+    kwargs: dict[str, Any] = {
+        "source_lang": _deepl_source_language(source_lang),
+        "target_lang": _deepl_target_language(target_lang),
+        "preserve_formatting": True,
+    }
     if tagged:
         kwargs["tag_handling"] = "xml"
         kwargs["outline_detection"] = False
@@ -220,19 +229,23 @@ def _insert_group(page: fitz.Page, group: dict[str, Any], translated: str, tagge
         try:
             _, span_meta = _build_tagged_text(group)
             translated_by_span = _parse_tagged_translation(translated, span_meta)
+            if len(translated_by_span) != len(span_meta):
+                raise ValueError("DeepL did not preserve all span markers")
             inserted_any = False
-            for tag, span in span_meta.items():
-                if tag in translated_by_span:
-                    inserted_any = _insert_span(page, span, translated_by_span[tag]) or inserted_any
+            for key, span in span_meta.items():
+                inserted_any = _insert_span(page, span, translated_by_span[key]) or inserted_any
             return inserted_any
         except Exception as exc:
-            print(f"서식 매핑 실패, 그룹 단위 삽입으로 전환: {exc}")
+            print(f"서식 매핑 실패, 마커 제거 후 그룹 단위 삽입으로 전환: {exc}")
+            clean_text = _strip_span_markers(_strip_format_tags(translated))
+    else:
+        clean_text = _strip_span_markers(_strip_format_tags(translated))
 
     style = _style(group)
     rect = fitz.Rect(group["bbox"])
     size = max(4.0, style["size"])
     while size >= 4:
-        result = page.insert_textbox(rect, translated, fontsize=size, fontname=FONT_NAME, fontfile=str(FONT_PATH), color=(0, 0, 0), align=_align(group, page.rect), overlay=True)
+        result = page.insert_textbox(rect, clean_text, fontsize=size, fontname=FONT_NAME, fontfile=str(FONT_PATH), color=(0, 0, 0), align=_align(group, page.rect), overlay=True)
         if result >= 0:
             return True
         size -= .5
@@ -265,7 +278,7 @@ def translate_pdf_file(input_pdf_path: str, output_pdf_path: str, source_lang: s
                 request_made = True
                 if success:
                     inserted = _insert_group(translated_page, group, translated, tagged_translation=True)
-                    display_translation = translated[:200]
+                    display_translation = _strip_span_markers(_strip_format_tags(translated))[:200]
                 else:
                     print("번역 실패, 원문 그대로 삽입:", text[:200])
                     inserted = _insert_group(translated_page, group, tagged_text, tagged_translation=True)
