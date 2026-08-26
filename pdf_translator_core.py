@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import time
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -14,7 +13,6 @@ FONT_BOLD_PATH = FONT_DIR / "NotoSansKR-Bold.ttf"
 FONT_NAME = "NotoSansKR"
 FONT_BOLD_NAME = "NotoSansKRBold"
 RETRIES = 3
-DELAYS = (10.0, 30.0, 60.0)
 ERROR_MARKERS = ("error 500", "server error", "that's an error", "that’s an error", "there was an error", "please try again later")
 
 
@@ -36,8 +34,6 @@ def translate_text_blocks(text: str, source_lang: str = "auto", target_lang: str
             raise RuntimeError("Google Translate returned an empty response or an error-page response")
         except Exception as exc:
             print(f"번역 group 실패 (시도 {attempt + 1}/{RETRIES}): {exc}")
-            if attempt < RETRIES - 1:
-                time.sleep(DELAYS[attempt])
     return text
 
 
