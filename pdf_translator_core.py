@@ -6,8 +6,8 @@ from pathlib import Path
 from typing import Any, Iterable
 from xml.etree import ElementTree as ET
 
-import fitz
 import deepl
+import fitz
 from grouping_engine import group_page
 
 FONT_DIR = Path(__file__).resolve().parent / "fonts"
@@ -36,20 +36,23 @@ def _escape_xml_text(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _span_style_flags(span: dict[str, Any]) -> tuple[bool, bool, bool]:
+def _span_style_flags(span: dict[str, Any]) -> tuple[bool, bool]:
     flags = int(span.get("flags", 0) or 0)
     font = str(span.get("font", "")).lower()
     bold = bool(flags & 16) or "bold" in font
     italic = bool(flags & 2) or "italic" in font or "oblique" in font
-    color = int(span.get("color", 0) or 0) != 0
-    return bold, italic, color
+    return bold, italic
 
 
 def _build_tagged_text(group: dict[str, Any]) -> tuple[str, dict[str, dict[str, Any]]]:
-    """Build one whole-group string. Style tags are inline markers, not separate translation requests."""
+    """Build one complete group as a single XML-aware DeepL request.
+
+    Formatting tags are inline in the sentence; no styled span is sent as a
+    separate translation request.
+    """
     span_meta: dict[str, dict[str, Any]] = {}
     chunks: list[str] = []
-    tag_index = 0
+    span_index = 0
 
     for line_index, line in enumerate(group.get("lines", [])):
         if line_index:
@@ -58,66 +61,58 @@ def _build_tagged_text(group: dict[str, Any]) -> tuple[str, dict[str, dict[str, 
             raw = str(span.get("text", ""))
             if not raw:
                 continue
-
-            tag = f"s{tag_index}"
-            tag_index += 1
-            span_meta[tag] = span
-            bold, italic, color = _span_style_flags(span)
-
-            # The entire group is sent in a single DeepL request. These XML tags
-            # are metadata around the text, so DeepL translates the text inside them.
-            opening: list[str] = []
-            closing: list[str] = []
+            key = f"s{span_index}"
+            span_index += 1
+            span_meta[key] = span
+            bold, italic = _span_style_flags(span)
+            opening = []
+            closing = []
             if bold:
                 opening.append("<bold>")
                 closing.insert(0, "</bold>")
             if italic:
                 opening.append("<italic>")
                 closing.insert(0, "</italic>")
-            if color:
-                opening.append(f"<color_{int(span.get('color', 0) or 0)}>")
-                closing.insert(0, f"</color_{int(span.get('color', 0) or 0)}>")
-
-            # Stable span tag lets us map translated text back to the original bbox.
-            chunks.append(f"<{tag}>" + "".join(opening) + _escape_xml_text(raw) + "".join(closing) + f"</{tag}>")
+            # The span itself is NOT an XML element sent to DeepL. It is only
+            # represented by an internal marker so formatting can be mapped back.
+            marker = f"[[SPAN_{span_index - 1}]]"
+            chunks.append("".join(opening) + marker + _escape_xml_text(raw) + "".join(closing))
 
     return "".join(chunks), span_meta
 
 
 def _parse_tagged_translation(value: str, span_meta: dict[str, dict[str, Any]]) -> dict[str, str]:
-    root = ET.fromstring(f"<root>{value}</root>")
+    """Recover translated text around internal span markers."""
     result: dict[str, str] = {}
-    for element in root.iter():
-        if element.tag not in span_meta:
+    for index, key in enumerate(span_meta):
+        marker = f"[[SPAN_{index}]]"
+        start = value.find(marker)
+        if start < 0:
             continue
-        result[element.tag] = "".join(element.itertext())
+        start += len(marker)
+        next_positions = [value.find(f"[[SPAN_{j}]]", start) for j in range(index + 1, len(span_meta))]
+        next_positions = [p for p in next_positions if p >= 0]
+        end = min(next_positions) if next_positions else len(value)
+        text = value[start:end]
+        # Remove any formatting XML tags while retaining translated text.
+        text = re.sub(r"</?(?:bold|italic|color_[^>]+)>", "", text)
+        result[key] = text.strip()
     return result
 
 
 def translate_text_blocks(text: str, source_lang: str = "auto", target_lang: str = "ko", tagged: bool = False) -> tuple[str, bool]:
-    """Translate one logical group with DeepL. Returns (result, success)."""
     if not text.strip():
         return text, False
-
     api_key = os.getenv("DEEPL_API_KEY")
     if not api_key:
         raise RuntimeError("DEEPL_API_KEY environment variable is not set")
-
     translator = deepl.DeepLClient(api_key)
-    target = _deepl_target_language(target_lang)
-    source = _deepl_source_language(source_lang)
-
+    kwargs: dict[str, Any] = {"source_lang": _deepl_source_language(source_lang), "target_lang": _deepl_target_language(target_lang), "preserve_formatting": True}
+    if tagged:
+        kwargs["tag_handling"] = "xml"
+        kwargs["outline_detection"] = False
     for attempt in range(RETRIES):
         try:
-            kwargs: dict[str, Any] = {
-                "source_lang": source,
-                "target_lang": target,
-                "preserve_formatting": True,
-            }
-            if tagged:
-                kwargs["tag_handling"] = "xml"
-                kwargs["outline_detection"] = False
-
             result = translator.translate_text(text, **kwargs)
             translated = str(result.text).strip()
             if translated:
@@ -129,7 +124,6 @@ def translate_text_blocks(text: str, source_lang: str = "auto", target_lang: str
                 delay = RETRY_BACKOFF * (attempt + 1)
                 print(f"재시도 전 {delay}초 대기...")
                 time.sleep(delay)
-
     return text, False
 
 
@@ -259,7 +253,6 @@ def translate_pdf_file(input_pdf_path: str, output_pdf_path: str, source_lang: s
             translated_page = output_doc.new_page(width=source_page.rect.width, height=source_page.rect.height)
             image_count += _copy_images(source_doc, translated_page, _images(source_page))
             print(f"페이지 {page_number}: {len(lines)} lines -> {len(groups)} groups")
-
             request_made = False
             for group_index, group in enumerate(groups):
                 text = str(group.get("text", "")).strip()
@@ -267,11 +260,9 @@ def translate_pdf_file(input_pdf_path: str, output_pdf_path: str, source_lang: s
                     continue
                 if request_made:
                     time.sleep(TRANSLATION_DELAY)
-
                 tagged_text, _ = _build_tagged_text(group)
                 translated, success = translate_text_blocks(tagged_text, source_lang, target_lang, tagged=True)
                 request_made = True
-
                 if success:
                     inserted = _insert_group(translated_page, group, translated, tagged_translation=True)
                     display_translation = translated[:200]
@@ -279,14 +270,12 @@ def translate_pdf_file(input_pdf_path: str, output_pdf_path: str, source_lang: s
                     print("번역 실패, 원문 그대로 삽입:", text[:200])
                     inserted = _insert_group(translated_page, group, tagged_text, tagged_translation=True)
                     display_translation = text[:200]
-
                 print(f"그룹 {group_index} ({group.get('group_type')}): {len(group.get('lines', []))} lines")
                 print("원문:", text[:200])
                 print("번역:", display_translation)
                 print("삽입 결과:", inserted, "direction:", group.get("direction"), "bbox:", group.get("bbox"))
                 if inserted:
                     translated_count += 1
-
             original_page = output_doc.new_page(width=source_page.rect.width, height=source_page.rect.height)
             original_page.show_pdf_page(original_page.rect, source_doc, source_page.number)
         output_doc.save(output_pdf_path, garbage=2, deflate=True)
