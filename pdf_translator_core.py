@@ -60,16 +60,8 @@ def _build_tagged_text(group: dict[str, Any]) -> tuple[str, dict[str, dict[str, 
             key = f"s{span_index}"
             span_meta[key] = span
             bold, italic, underline = _span_style_flags(span)
-            opening = (
-                ("<bold>" if bold else "")
-                + ("<italic>" if italic else "")
-                + ("<underline>" if underline else "")
-            )
-            closing = (
-                ("</underline>" if underline else "")
-                + ("</italic>" if italic else "")
-                + ("</bold>" if bold else "")
-            )
+            opening = (("<bold>" if bold else "") + ("<italic>" if italic else "") + ("<underline>" if underline else ""))
+            closing = (("</underline>" if underline else "") + ("</italic>" if italic else "") + ("</bold>" if bold else ""))
             marker = f"[[MAP_{token}_{span_index}]]"
             chunks.append(opening + _escape_xml_text(raw) + closing + marker)
             span_index += 1
@@ -104,7 +96,6 @@ def _parse_tagged_translation(value: str, span_meta: dict[str, dict[str, Any]]) 
     matches = list(re.finditer(r"\[\[MAP_([A-Za-z0-9]+)_(\d+)\]\]", value))
     if not matches:
         raise ValueError("DeepL removed all mapping markers")
-
     result: dict[str, str] = {}
     expected_token = matches[0].group(1)
     previous_end = 0
@@ -120,7 +111,6 @@ def _parse_tagged_translation(value: str, span_meta: dict[str, dict[str, Any]]) 
             piece = piece.lstrip("\n")
         result[key] = piece
         previous_end = match.end()
-
     if len(result) != len(span_meta):
         missing = [k for k in span_meta if k not in result]
         raise ValueError(f"DeepL did not preserve all mapping markers: {missing}")
@@ -131,7 +121,6 @@ def _parse_tagged_html_parts(value: str, span_meta: dict[str, dict[str, Any]]) -
     matches = list(re.finditer(r"\[\[MAP_([A-Za-z0-9]+)_(\d+)\]\]", value))
     if not matches:
         raise ValueError("DeepL removed all mapping markers")
-
     expected_token = matches[0].group(1)
     parts: list[tuple[str, dict[str, Any]]] = []
     previous_end = 0
@@ -142,11 +131,9 @@ def _parse_tagged_html_parts(value: str, span_meta: dict[str, dict[str, Any]]) -
         key = f"s{index}"
         if key not in span_meta:
             continue
-        piece = value[previous_end:match.start()]
-        piece = _normalize_boundary_whitespace(piece)
+        piece = _normalize_boundary_whitespace(value[previous_end:match.start()])
         parts.append((piece, span_meta[key]))
         previous_end = match.end()
-
     if len(parts) != len(span_meta):
         missing = [k for k in span_meta if k not in {f"s{i}" for i in range(len(parts))}]
         raise ValueError(f"DeepL did not preserve all mapping markers: {missing}")
@@ -157,9 +144,7 @@ def _style_html_for_span(text: str, span: dict[str, Any]) -> str:
     text = re.sub(r"</?bold(?:\s+[^>]*)?>", "", text)
     text = re.sub(r"</?italic(?:\s+[^>]*)?>", "", text)
     text = re.sub(r"</?underline(?:\s+[^>]*)?>", "", text)
-    text = _strip_mapping_markers(text)
-    text = text.replace("\n", "<br>")
-
+    text = _strip_mapping_markers(text).replace("\n", "<br>")
     _, _, underline = _span_style_flags(span)
     flags = int(span.get("flags", 0) or 0)
     font = str(span.get("font", "")).lower()
@@ -171,7 +156,6 @@ def _style_html_for_span(text: str, span: dict[str, Any]) -> str:
         color = "#%02x%02x%02x" % rgb
     except Exception:
         color = "#000000"
-
     size = float(span.get("size", 12) or 12)
     styles = [f"font-size:{size:g}pt", f"color:{color}"]
     if bold:
@@ -185,10 +169,7 @@ def _style_html_for_span(text: str, span: dict[str, Any]) -> str:
 
 def _build_group_html(translated: str, span_meta: dict[str, dict[str, Any]]) -> str:
     parts = _parse_tagged_html_parts(translated, span_meta)
-    html_parts: list[str] = []
-    for piece, span in parts:
-        html_parts.append(_style_html_for_span(piece, span))
-    return "".join(html_parts)
+    return "".join(_style_html_for_span(piece, span) for piece, span in parts)
 
 
 def translate_text_blocks(text: str, source_lang: str = "auto", target_lang: str = "ko", tagged: bool = False) -> tuple[str, bool]:
@@ -299,7 +280,7 @@ def _align(group: dict[str, Any], page_rect: fitz.Rect) -> int:
     return fitz.TEXT_ALIGN_LEFT
 
 
-def _insert_group(page: fitz.Page, group: dict[str, Any], translated: str, tagged_translation: bool = False) -> bool:
+def _insert_group(page: fitz.Page, group: dict[str, Any], translated: str, tagged_translation: bool = False, archive: fitz.Archive | None = None) -> bool:
     if tagged_translation:
         try:
             _, span_meta = _build_tagged_text(group)
@@ -307,7 +288,6 @@ def _insert_group(page: fitz.Page, group: dict[str, Any], translated: str, tagge
             rect = fitz.Rect(group["bbox"])
             style = _style(group)
             size = max(4.0, style["size"])
-            archive = fitz.Archive(str(FONT_DIR))
             css = f"""
             @font-face {{ font-family: {FONT_NAME}; src: url(NotoSansKR-Regular.ttf); }}
             @font-face {{ font-family: {FONT_NAME}; src: url(NotoSansKR-Bold.ttf); font-weight: bold; }}
@@ -326,7 +306,7 @@ def _insert_group(page: fitz.Page, group: dict[str, Any], translated: str, tagge
     rect = fitz.Rect(group["bbox"])
     size = max(4.0, style["size"])
     while size >= 4:
-        result = page.insert_textbox(rect, clean_text, fontsize=size, fontname=FONT_NAME, fontfile=str(FONT_PATH), color=(0, 0, 0), align=_align(group, page.rect), overlay=True)
+        result = page.insert_textbox(rect, clean_text, fontsize=size, fontname=FONT_NAME, color=(0, 0, 0), align=_align(group, page.rect), overlay=True)
         if result >= 0:
             return True
         size -= .5
@@ -336,15 +316,24 @@ def _insert_group(page: fitz.Page, group: dict[str, Any], translated: str, tagge
 def translate_pdf_file(input_pdf_path: str, output_pdf_path: str, source_lang: str = "auto", target_lang: str = "ko", debug_grouping: bool = False) -> int:
     if not FONT_PATH.exists():
         raise FileNotFoundError(f"Noto Sans KR font not found: {FONT_PATH}")
+    if not FONT_BOLD_PATH.exists():
+        raise FileNotFoundError(f"Noto Sans KR bold font not found: {FONT_BOLD_PATH}")
     source_doc = fitz.open(input_pdf_path)
     output_doc = fitz.open()
     translated_count = total_groups = image_count = 0
+    shared_archive = fitz.Archive(str(FONT_DIR))
     try:
         for page_number, source_page in enumerate(source_doc, start=1):
             lines = _get_span_info(source_page)
             groups = group_page(source_page, lines, debug=debug_grouping)
             total_groups += len(groups)
             translated_page = output_doc.new_page(width=source_page.rect.width, height=source_page.rect.height)
+
+            # Install each font once per output document resource set instead of
+            # letting every insert_textbox call embed the font file again.
+            translated_page.insert_font(fontname=FONT_NAME, fontfile=str(FONT_PATH))
+            translated_page.insert_font(fontname=FONT_BOLD_NAME, fontfile=str(FONT_BOLD_PATH))
+
             image_count += _copy_images(source_doc, translated_page, _images(source_page))
             print(f"페이지 {page_number}: {len(lines)} lines -> {len(groups)} groups")
             for group_index, group in enumerate(groups):
@@ -354,12 +343,12 @@ def translate_pdf_file(input_pdf_path: str, output_pdf_path: str, source_lang: s
                 tagged_text, _ = _build_tagged_text(group)
                 translated, success = translate_text_blocks(tagged_text, source_lang, target_lang, tagged=True)
                 if success:
-                    inserted = _insert_group(translated_page, group, translated, tagged_translation=True)
+                    inserted = _insert_group(translated_page, group, translated, tagged_translation=True, archive=shared_archive)
                     display_translation = _clean_piece(translated)[:200]
                 else:
                     print("번역 실패, 원문 그대로 삽입:", text[:200])
                     clean_original = _clean_piece(tagged_text)
-                    inserted = _insert_group(translated_page, group, clean_original, tagged_translation=False)
+                    inserted = _insert_group(translated_page, group, clean_original, tagged_translation=False, archive=shared_archive)
                     display_translation = text[:200]
                 print(f"그룹 {group_index} ({group.get('group_type')}): {len(group.get('lines', []))} lines")
                 print("원문:", text[:200])
@@ -369,7 +358,11 @@ def translate_pdf_file(input_pdf_path: str, output_pdf_path: str, source_lang: s
                     translated_count += 1
             original_page = output_doc.new_page(width=source_page.rect.width, height=source_page.rect.height)
             original_page.show_pdf_page(original_page.rect, source_doc, source_page.number)
-        output_doc.save(output_pdf_path, garbage=2, deflate=True)
+
+        # Subset fonts to only the glyphs actually used, then perform full
+        # garbage collection / compression when saving.
+        output_doc.subset_fonts(verbose=False)
+        output_doc.save(output_pdf_path, garbage=4, deflate=True, clean=True)
     finally:
         output_doc.close()
         source_doc.close()
