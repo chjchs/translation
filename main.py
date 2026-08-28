@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 
-from pdf_translator_core import translate_pdf_file
+from html_pdf_translator import translate_pdf_file
 
 
 def main() -> None:
