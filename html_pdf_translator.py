@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,14 @@ FONT_DIR = Path(__file__).resolve().parent / "fonts"
 FONT_PATH = FONT_DIR / "NotoSansKR-Regular.ttf"
 FONT_BOLD_PATH = FONT_DIR / "NotoSansKR-Bold.ttf"
 FONT_NAME = "NotoSansKR"
+
+# Local translation hints are extracted only from the current group.
+# They are supplied to DeepL as context, so they never become a document-wide glossary.
+KOREAN = r"가-힣"
+HINT_PATTERN = re.compile(
+    rf"(?P<source>[A-Za-z][A-Za-z0-9+./'’\- ]{{1,100}}?)\s*"
+    rf"\(\s*(?P<target>[{KOREAN}][{KOREAN}0-9·\- ]{{0,80}})"
+)
 
 
 def _target_lang(lang: str) -> str:
@@ -83,15 +92,55 @@ def _plain_group_text(group: dict[str, Any]) -> str:
     return "\n".join("".join(str(span.get("text", "")) for span in line.get("spans", [])) for line in group.get("lines", [])).strip()
 
 
-def _translate_html(html_text: str, source_lang: str, target_lang: str) -> str:
+def _extract_local_translation_hints(text: str) -> list[tuple[str, str]]:
+    """Find inline English(Korean) hints in this group only.
+
+    Examples:
+      smooth muscle(평활근)
+      Involuntary (불수의근, non-consciously-controlled)
+
+    These are not persisted and are never sent as a DeepL glossary.
+    """
+    hints: list[tuple[str, str]] = []
+    for match in HINT_PATTERN.finditer(text):
+        source = re.sub(r"\s+", " ", match.group("source")).strip()
+        target = re.sub(r"\s+", " ", match.group("target")).strip()
+        if not source or not target:
+            continue
+        # Avoid treating a long phrase containing punctuation as a term.
+        if len(source) > 80 or len(target) > 60:
+            continue
+        pair = (source, target)
+        if pair not in hints:
+            hints.append(pair)
+    return hints
+
+
+def _build_local_context(text: str) -> str | None:
+    hints = _extract_local_translation_hints(text)
+    if not hints:
+        return None
+    return "Local translation hints from this text: " + "; ".join(
+        f"{source} = {target}" for source, target in hints
+    )
+
+
+def _translate_html(html_text: str, source_lang: str, target_lang: str, context: str | None = None) -> str:
     key = os.getenv("DEEPL_API_KEY")
     if not key:
         raise RuntimeError("DEEPL_API_KEY environment variable is not set")
     translator = deepl.DeepLClient(key)
-    kwargs: dict[str, Any] = {"target_lang": _target_lang(target_lang), "tag_handling": "html", "preserve_formatting": True}
+    kwargs: dict[str, Any] = {
+        "target_lang": _target_lang(target_lang),
+        "tag_handling": "html",
+        "tag_handling_version": "v2",
+        "preserve_formatting": True,
+    }
     source = _source_lang(source_lang)
     if source:
         kwargs["source_lang"] = source
+    if context:
+        kwargs["context"] = context
     return str(translator.translate_text(html_text, **kwargs).text).strip()
 
 
@@ -186,8 +235,9 @@ def translate_pdf_file(input_pdf_path: str, output_pdf_path: str, source_lang: s
                 if len(text) < 2:
                     continue
                 source_html = _group_to_html(group)
+                local_context = _build_local_context(text)
                 try:
-                    translated_html = _translate_html(source_html, source_lang, target_lang)
+                    translated_html = _translate_html(source_html, source_lang, target_lang, local_context)
                 except Exception as exc:
                     print(f"번역 실패: {exc}")
                     translated_html = ""
@@ -196,6 +246,8 @@ def translate_pdf_file(input_pdf_path: str, output_pdf_path: str, source_lang: s
                 if translated_html:
                     inserted = _insert_html_group(translated_page, group, translated_html, archive)
                     print("원문 HTML:", source_html[:300])
+                    if local_context:
+                        print("로컬 번역 힌트:", local_context)
                     print("번역 HTML:", translated_html[:300])
 
                 if not inserted:
