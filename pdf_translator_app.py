@@ -4,7 +4,7 @@ import os
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
-from pdf_translator_core import translate_pdf_file
+from html_pdf_translator import translate_pdf_file
 
 
 class PdfTranslatorApp:
