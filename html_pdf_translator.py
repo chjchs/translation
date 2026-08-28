@@ -15,13 +15,19 @@ FONT_PATH = FONT_DIR / "NotoSansKR-Regular.ttf"
 FONT_BOLD_PATH = FONT_DIR / "NotoSansKR-Bold.ttf"
 FONT_NAME = "NotoSansKR"
 
-# Local translation hints are extracted only from the current group.
-# They are supplied to DeepL as context, so they never become a document-wide glossary.
 KOREAN = r"가-힣"
+# Match inline English(Korean) hints robustly across normal spaces, NBSPs,
+# zero-width formatting characters and spaces around the parentheses.
 HINT_PATTERN = re.compile(
-    rf"(?P<source>[A-Za-z][A-Za-z0-9+./'’\- ]{{1,100}}?)\s*"
-    rf"\(\s*(?P<target>[{KOREAN}][{KOREAN}0-9·\- ]{{0,80}})"
+    rf"(?P<source>[A-Za-z][A-Za-z0-9+./'’\-]*(?:[\s\u00a0\u200b]+[A-Za-z][A-Za-z0-9+./'’\-]*){{0,15}})"
+    rf"[\s\u00a0\u200b]*\([\s\u00a0\u200b]*"
+    rf"(?P<target>[{KOREAN}][{KOREAN}0-9·\-]*(?:[\s\u00a0\u200b]+[{KOREAN}][{KOREAN}0-9·\-]*){{0,12}})"
+    rf"[\s\u00a0\u200b]*[,)"
 )
+
+
+def _normalize_text(text: str) -> str:
+    return re.sub(r"[\s\u00a0\u200b]+", " ", text).strip()
 
 
 def _target_lang(lang: str) -> str:
@@ -61,7 +67,6 @@ def _span_to_html(span: dict[str, Any]) -> str:
     text = html.escape(str(span.get("text", "")), quote=False)
     if not _has_special_style(span):
         return text
-
     bold, italic, underline = _span_flags(span)
     styles: list[str] = []
     color = _span_color(span)
@@ -69,7 +74,6 @@ def _span_to_html(span: dict[str, Any]) -> str:
         styles.append(f"color:{color}")
     if underline:
         styles.append("text-decoration:underline")
-
     result = text
     if styles:
         result = f'<span style="{";".join(styles)}">{result}</span>'
@@ -93,22 +97,13 @@ def _plain_group_text(group: dict[str, Any]) -> str:
 
 
 def _extract_local_translation_hints(text: str) -> list[tuple[str, str]]:
-    """Find inline English(Korean) hints in this group only.
-
-    Examples:
-      smooth muscle(평활근)
-      Involuntary (불수의근, non-consciously-controlled)
-
-    These are not persisted and are never sent as a DeepL glossary.
-    """
+    """Extract English(Korean) hints from this group only."""
+    normalized = _normalize_text(text)
     hints: list[tuple[str, str]] = []
-    for match in HINT_PATTERN.finditer(text):
-        source = re.sub(r"\s+", " ", match.group("source")).strip()
-        target = re.sub(r"\s+", " ", match.group("target")).strip()
-        if not source or not target:
-            continue
-        # Avoid treating a long phrase containing punctuation as a term.
-        if len(source) > 80 or len(target) > 60:
+    for match in HINT_PATTERN.finditer(normalized):
+        source = _normalize_text(match.group("source"))
+        target = _normalize_text(match.group("target"))
+        if not source or not target or len(source) > 80 or len(target) > 60:
             continue
         pair = (source, target)
         if pair not in hints:
@@ -120,9 +115,7 @@ def _build_local_context(text: str) -> str | None:
     hints = _extract_local_translation_hints(text)
     if not hints:
         return None
-    return "Local translation hints from this text: " + "; ".join(
-        f"{source} = {target}" for source, target in hints
-    )
+    return "Local translation hints from this text: " + "; ".join(f"{source} = {target}" for source, target in hints)
 
 
 def _translate_html(html_text: str, source_lang: str, target_lang: str, context: str | None = None) -> str:
@@ -130,12 +123,7 @@ def _translate_html(html_text: str, source_lang: str, target_lang: str, context:
     if not key:
         raise RuntimeError("DEEPL_API_KEY environment variable is not set")
     translator = deepl.DeepLClient(key)
-    kwargs: dict[str, Any] = {
-        "target_lang": _target_lang(target_lang),
-        "tag_handling": "html",
-        "tag_handling_version": "v2",
-        "preserve_formatting": True,
-    }
+    kwargs: dict[str, Any] = {"target_lang": _target_lang(target_lang), "tag_handling": "html", "tag_handling_version": "v2", "preserve_formatting": True}
     source = _source_lang(source_lang)
     if source:
         kwargs["source_lang"] = source
@@ -214,7 +202,6 @@ def translate_pdf_file(input_pdf_path: str, output_pdf_path: str, source_lang: s
         raise FileNotFoundError(f"Noto Sans KR font not found: {FONT_PATH}")
     if not FONT_BOLD_PATH.exists():
         raise FileNotFoundError(f"Noto Sans KR bold font not found: {FONT_BOLD_PATH}")
-
     source_doc = fitz.open(input_pdf_path)
     output_doc = fitz.open()
     archive = fitz.Archive(str(FONT_DIR))
@@ -229,7 +216,6 @@ def translate_pdf_file(input_pdf_path: str, output_pdf_path: str, source_lang: s
             translated_page = output_doc.new_page(width=source_page.rect.width, height=source_page.rect.height)
             image_count += _copy_images(source_doc, translated_page, _images(source_page))
             print(f"페이지 {page_number}: {len(lines)} lines -> {len(groups)} groups")
-
             for group_index, group in enumerate(groups):
                 text = _plain_group_text(group)
                 if len(text) < 2:
@@ -241,7 +227,6 @@ def translate_pdf_file(input_pdf_path: str, output_pdf_path: str, source_lang: s
                 except Exception as exc:
                     print(f"번역 실패: {exc}")
                     translated_html = ""
-
                 inserted = False
                 if translated_html:
                     inserted = _insert_html_group(translated_page, group, translated_html, archive)
@@ -249,27 +234,22 @@ def translate_pdf_file(input_pdf_path: str, output_pdf_path: str, source_lang: s
                     if local_context:
                         print("로컬 번역 힌트:", local_context)
                     print("번역 HTML:", translated_html[:300])
-
                 if not inserted:
                     fallback = html.escape(text).replace("\n", "<br>")
                     inserted = _insert_html_group(translated_page, group, fallback, archive)
                     print("HTML 번역 삽입 실패 -> 원문 fallback")
-
                 print(f"그룹 {group_index} ({group.get('group_type')}): {len(group.get('lines', []))} lines, inserted={inserted}")
                 print("원문:", text[:200])
                 print("삽입 위치:", group.get("bbox"))
                 if inserted:
                     translated_count += 1
-
             original_page = output_doc.new_page(width=source_page.rect.width, height=source_page.rect.height)
             original_page.show_pdf_page(original_page.rect, source_doc, source_page.number)
-
         output_doc.subset_fonts(verbose=False)
         output_doc.save(output_pdf_path, garbage=4, deflate=True, clean=True)
     finally:
         output_doc.close()
         source_doc.close()
-
     print("총 그룹:", total_groups)
     print("번역하여 삽입한 그룹:", translated_count)
     print("복사한 이미지:", image_count)
